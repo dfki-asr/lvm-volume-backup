@@ -25,6 +25,63 @@ log() {
     echo >&2 "* $*"
 }
 
+enable_file_logging() {
+    if [[ -z "$LOG_FILE" ]]; then
+        fatal "The LOG_FILE variable must not be empty."
+    fi
+
+    exec > >(tee -ia "$LOG_FILE")
+    exec 2> >(tee -ia "$LOG_FILE" >&2)
+
+    ## Close STDOUT file descriptor
+    #exec 1<&-
+    ## Close STDERR FD
+    #exec 2<&-
+
+    ## Open STDOUT as $LOG_FILE file for read and write.
+    #exec 1>>"$LOG_FILE" 2>&1
+
+    echo
+    echo "$(date): ${BASH_SOURCE[0]}: start logging"
+
+    on_error() {
+        local errmsg err_lineno err_command err_code
+        err_lineno="${1}"
+        err_command="${2}"
+        err_code="${3:-0}"
+
+        ## Workaround for read EOF combo tripping traps
+        if ! ((err_code)); then
+            return "${err_code}"
+        fi
+
+        errmsg=$(awk 'NR>L-4 && NR<L+4 { printf "%-5d%3s%s\n",NR,(NR==L?">>>":""),$0 }' L="$err_lineno" "$0")
+        log "Error occurred in '$err_command' command
+$errmsg"
+        if ((BASH_SUBSHELL != 0)); then
+            # Exit from subshell
+            exit "${err_code}"
+        else
+            # Exit from top level script
+            exit "${err_code}"
+        fi
+    }
+
+    trap 'on_error ${LINENO} "${BASH_COMMAND}" "${?}"' ERR
+
+    on_exit() {
+        cleanup
+        log "${BASH_SOURCE[0]}: exiting"
+        # Close STDOUT file descriptor
+        exec 1<&-
+        # Close STDERR FD
+        exec 2<&-
+    }
+
+    trap 'on_exit' EXIT
+}
+### END LOGGING
+
 rtrim() {
     echo -n "${1%"${1##*[![:space:]]}"}"
 }
@@ -317,6 +374,8 @@ lvm2_for_each_logical_volume() {
     done <<< "$LVS_OUTPUT"
 }
 
+
+
 # Main program
 
 print_help() {
@@ -327,6 +386,7 @@ print_help() {
     echo "  -l, --list-volumes           Print list of LVM volumes"
     echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
     echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
+    echo "      --log-file=              Log all output and errors to the specified log file"
     echo "      --                       End of options"
 }
 
@@ -431,6 +491,7 @@ make_new_snapshots() {
 }
 
 IGNORE_VOLUMES=()
+LOG_FILE=
 
 while [[ "$1" == "-"* ]]; do
     case "$1" in
@@ -465,6 +526,14 @@ while [[ "$1" == "-"* ]]; do
         LV_SNAPSHOT_SUFFIX="${1#*=}"
         shift
         ;;
+    --log-file)
+        LOG_FILE="$2"
+        shift 2
+        ;;
+    --log-file=*)
+        LOG_FILE="${1#*=}"
+        shift
+        ;;
     --help)
         print_help
         exit
@@ -487,7 +556,11 @@ if [[ $EUID -ne 0 ]]; then
     # exec sudo -E "$0" "$@"
 fi
 
-trap cleanup EXIT
+if [[ -n "$LOG_FILE" ]]; then
+    enable_file_logging
+else
+    trap cleanup EXIT
+fi
 
 log "Start backup of LVM volumes"
 
