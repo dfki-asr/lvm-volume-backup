@@ -374,22 +374,6 @@ lvm2_for_each_logical_volume() {
     done <<< "$LVS_OUTPUT"
 }
 
-
-
-# Main program
-
-print_help() {
-    echo "Backup LVM volumes"
-    echo
-    echo "$0 [options]"
-    echo "options:"
-    echo "  -l, --list-volumes           Print list of LVM volumes"
-    echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
-    echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
-    echo "      --log-file=              Log all output and errors to the specified log file"
-    echo "      --                       End of options"
-}
-
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         fatal "You must run this command as root"
@@ -406,11 +390,33 @@ print_lvm_volume_info() {
     echo
 }
 
+
+MOUNT_DIR=
+MOUNT_DIR_MOUNTED=
+KPARTX_PARTS_ADDED=
+
+volume_cleanup() {
+    log "Volume cleanup"
+    if [[ -n "$MOUNT_DIR" && "$MOUNT_DIR_MOUNTED" = "true" ]]; then
+        log "Unmounting $MOUNT_DIR"
+        umount "$MOUNT_DIR" || true;
+        rmdir "$MOUNT_DIR" || true;
+        MOUNT_DIR_MOUNTED=false
+        MOUNT_DIR=
+    fi
+    if [[ "$KPARTX_PARTS_ADDED" = "true" ]]; then
+        log "Remove kpartx volumes"
+        kpartx -vd "$VOLUME_PATH" || true;
+        KPARTX_PARTS_ADDED=false
+    fi
+}
+
 CREATED_SNAPSHOT_PATHS=()
 
 cleanup() {
     local snapshot_path
     log "Cleanup"
+    volume_cleanup
     log "Remove created snapshots"
     for snapshot_path in "${CREATED_SNAPSHOT_PATHS[@]}"; do
         log "Remove snapshot $snapshot_path"
@@ -477,7 +483,7 @@ make_new_snapshots() {
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
             log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
             (set -xe;
-                lvcreate -s -n "$LV_SNAPSHOT_NAME" "$LVM2_LV_PATH"; 
+                lvcreate -s -n "$LV_SNAPSHOT_NAME" "$LVM2_LV_PATH";
             )
         else
             log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
@@ -490,7 +496,35 @@ make_new_snapshots() {
     echo;
 }
 
+print_help() {
+    echo "Backup LVM volumes"
+    echo
+    echo "$0 [options]"
+    echo "options:"
+    echo "  -l, --list-volumes           Print list of LVM volumes"
+    echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
+    echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
+    echo "  -w, --part-rw                Add partitions in read/write mode"
+    echo "  -p, --dest-prefix=           Destination file prefix (add / for directory)"
+    echo "  -d, --debug                  Enable debug mode"
+    echo "      --log-file=              Log all output and errors to the specified log file"
+    echo "      --                       End of options"
+}
+
+# Main program
+
+# Check required commands
+for CMD in lvs lvcreate kpartx mount tar; do
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+        fatal "$cmd command is missing"
+    fi
+done
+
+
 IGNORE_VOLUMES=()
+DEST_FILE_PREFIX=
+KPARTX_RW=
+DEBUG=
 LOG_FILE=
 
 while [[ "$1" == "-"* ]]; do
@@ -524,6 +558,22 @@ while [[ "$1" == "-"* ]]; do
         ;;
     --snapshot-suffix=*)
         LV_SNAPSHOT_SUFFIX="${1#*=}"
+        shift
+        ;;
+    -p|--dest-prefix)
+        DEST_FILE_PREFIX="$2"
+        shift 2
+        ;;
+    --dest-prefix=*)
+        DEST_FILE_PREFIX="${1#*=}"
+        shift
+        ;;
+    -w|--part-rw)
+        KPARTX_RW=true
+        shift
+        ;;
+    -d|--debug)
+        DEBUG=true
         shift
         ;;
     --log-file)
@@ -564,11 +614,120 @@ fi
 
 log "Start backup of LVM volumes"
 
+if [[ "$DEBUG" == "true" ]]; then
+    set -x
+fi
+
 message "* Cleanup old snapshots"
 lvm2_for_each_logical_volume cleanup_old_snapshots
 
 message "* Make new snapshots"
 lvm2_for_each_logical_volume make_new_snapshots
+
+for VOLUME_PATH in "${CREATED_SNAPSHOT_PATHS[@]}"; do
+    log "Process volume path $VOLUME_PATH"
+
+    if [[ -z "$DEST_FILE_PREFIX" ]]; then
+        DEST_FILE_PREFIX=./
+    fi
+
+    if [[ "$DEST_FILE_PREFIX" = */ && ! -d "$DEST_FILE_PREFIX" ]]; then
+        mkdir -p "$DEST_FILE_PREFIX"
+    elif [[ -d "$DEST_FILE_PREFIX" && "$DEST_FILE_PREFIX" != */ ]]; then
+        DEST_FILE_PREFIX=$DEST_FILE_PREFIX/
+    fi
+
+    log "Volume path: $VOLUME_PATH"
+    log "Destination file prefix: $DEST_FILE_PREFIX"
+
+    KPARTX_OUT=$(kpartx -l "$VOLUME_PATH" | awk '{ print $1 }')
+
+    # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
+    KPARTX_PARTS=()
+    while IFS= read -r; do
+        if [[ -n "$REPLY" && "$REPLY" != [[:space:]]* ]]; then
+            KPARTX_PARTS+=("$REPLY")
+        fi
+    done <<<"$KPARTX_OUT"
+    if [[ -n "$REPLY" && "$REPLY" != [[:space:]]* ]]; then
+        KPARTX_PARTS+=("$REPLY")
+    fi
+
+    #KPARTX_PARTS=()
+    #while IFS='' read -r line; do KPARTX_PARTS+=("$line"); done <<<"$KPARTX_OUT"
+
+    if [[ "${#KPARTX_PARTS[@]}" -ne 0 ]]; then
+        if [[ "$KPARTX_RW" = "true" ]]; then
+            kpartx -av "$VOLUME_PATH"
+        else
+            kpartx -avr "$VOLUME_PATH"
+        fi
+
+        KPARTX_PARTS_ADDED=true
+
+        MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
+
+        for PART_NAME in "${KPARTX_PARTS[@]}"; do
+            PART_DEV=/dev/mapper/$PART_NAME
+
+            #if [[ "$KPARTX_RW" = "true" ]]; then
+            #    fsck "$PART_DEV"
+            #fi
+
+            if ! mount -o ro -t auto "$PART_DEV" "$MOUNT_DIR"; then
+                fatal "Could not mount partition device $PART_DEV to directory $MOUNT_DIR"
+            fi
+            MOUNT_DIR_MOUNTED=true
+
+            message "* Contents of the partition $PART_NAME:"
+            ls -lA "$MOUNT_DIR"
+
+            DEST_FILE=${DEST_FILE_PREFIX}${PART_NAME}.tar.bz2
+
+            log "Backup to file $DEST_FILE"
+
+            if [[ -e "$DEST_FILE" ]]; then
+                fatal "File $DEST_FILE already exists"
+            fi
+
+            tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
+
+            umount "$MOUNT_DIR"
+            MOUNT_DIR_MOUNTED=false
+        done
+
+    else
+        KPARTX_PARTS_ADDED=
+
+        log "No partitions to mount in $VOLUME_PATH"
+        log "Trying to mount a full volume as disk"
+
+        MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
+
+        if ! mount -o ro -t auto "$VOLUME_PATH" "$MOUNT_DIR"; then
+            fatal "Could not mount disk $VOLUME_PATH to directory $MOUNT_DIR"
+        fi
+        MOUNT_DIR_MOUNTED=true
+
+        message "* Contents of the volume $VOLUME_PATH:"
+        ls -lA "$MOUNT_DIR"
+
+        BN=$(basename -- "$VOLUME_PATH")
+        DEST_FILE=${DEST_FILE_PREFIX}${BN}.tar.bz2
+
+        log "Backup to file $DEST_FILE"
+
+        if [[ -e "$DEST_FILE" ]]; then
+            fatal "File $DEST_FILE already exists"
+        fi
+
+        tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
+
+        umount "$MOUNT_DIR"
+        MOUNT_DIR_MOUNTED=false
+    fi
+
+done
 
 echo
 echo "Created snapshot paths: ${CREATED_SNAPSHOT_PATHS[*]}"
