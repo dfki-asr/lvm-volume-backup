@@ -13,11 +13,16 @@ error() {
 
 fatal() {
     error "$@"
+    echo >&2 "Exiting ..."
     exit 1
 }
 
 message() {
     echo >&2 "$*"
+}
+
+dbg() {
+    echo >&2 "Debug: $*"
 }
 
 log() {
@@ -412,6 +417,8 @@ volume_cleanup() {
 }
 
 CREATED_SNAPSHOT_PATHS=()
+CREATED_SNAPSHOT_VG_NAMES=()
+CREATED_SNAPSHOT_ORIG_LV_NAMES=()
 
 cleanup() {
     local snapshot_path
@@ -420,8 +427,17 @@ cleanup() {
     log "Remove created snapshots"
     for snapshot_path in "${CREATED_SNAPSHOT_PATHS[@]}"; do
         log "Remove snapshot $snapshot_path"
-        (set -xe; lvremove -y "$snapshot_path";)
+        (set -xe;
+            if ! lvremove -y "$snapshot_path"; then
+                # Try to remove kpartx mapping
+                kpartx -vd "$snapshot_path" || true;
+                lvremove -y "$snapshot_path" || true;
+            fi
+        )
     done
+    CREATED_SNAPSHOT_PATHS=()
+    CREATED_SNAPSHOT_VG_NAMES=()
+    CREATED_SNAPSHOT_ORIG_LV_NAMES=()
     log "End backup of LVM volumes"
 }
 
@@ -431,67 +447,81 @@ cleanup_old_snapshots() {
         message "* Check snapshot $LVM2_LV_NAME / $LVM2_VG_NAME"
         if [[ "$LVM2_LV_NAME" == *"$LV_SNAPSHOT_SUFFIX" ]]; then
             log "Remove old snapshot $LVM2_LV_PATH"
-            (set -xe; lvremove -y "$LVM2_LV_PATH";)
+            (set -xe;
+                if ! lvremove -y "$LVM2_LV_PATH"; then
+                    # Try to remove kpartx mapping
+                    kpartx -vd "$LVM2_LV_PATH" || true;
+                    lvremove -y "$LVM2_LV_PATH";
+                fi
+            )
         fi
     fi
 }
 
-make_new_snapshots() {
-    local MAKE_SNAPSHOT=true ERR ivol
+create_new_snapshots() {
+    local CREATE_SNAPSHOT=true ERR ivol
 
     for ivol in "${IGNORE_VOLUMES[@]}"; do
         if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
-            log "ignore volume $ivol"
+            log "Ignore volume $ivol"
             return 0
         fi
     done
 
     if lvm2_attr_is_cow "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR=snapshots
     elif lvm2_attr_is_locked "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="locked volumes"
     elif lvm2_attr_is_pvmove "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="pvmoved volumes"
     elif lvm2_attr_is_merging_origin "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="an origin that has a merging snapshot"
     elif lvm2_attr_is_any_cache "$LVM2_LV_ATTR"; then
         # Actually, this is too strict, because snapshots can be taken from caches
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="cache"
     elif lvm2_attr_is_thin_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_thin_volume "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="thin pool type volumes"
     elif lvm2_attr_is_mirror_type_or_pvmove "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="mirror subvolumes or mirrors"
     elif lvm2_attr_is_raid_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_raid "$LVM2_LV_ATTR"; then
-        MAKE_SNAPSHOT=false
+        CREATE_SNAPSHOT=false
         ERR="raid subvolumes";
     fi
 
-    if [[ "$MAKE_SNAPSHOT" = "false" ]]; then
-        message "* Don't make snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $ERR are not supported."
+    if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
+        message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $ERR are not supported."
     else
-        message "* Make snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
+        message "* Create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
         lvm2_attr_info "$LVM2_LV_ATTR"
 
         LV_SNAPSHOT_NAME=${LVM2_LV_NAME}${LV_SNAPSHOT_SUFFIX}
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
             log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
             (set -xe;
-                lvcreate -s -n "$LV_SNAPSHOT_NAME" "$LVM2_LV_PATH";
+                lvcreate -s -n "$LV_SNAPSHOT_NAME" -kn "$LVM2_LV_PATH";
             )
         else
             log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
             (set -xe;
-                lvcreate -l50%FREE -s -n "$LV_SNAPSHOT_NAME" "$LVM2_LV_PATH";
+                lvcreate -l50%FREE -s -n "$LV_SNAPSHOT_NAME" -kn "$LVM2_LV_PATH";
             )
         fi
+
+        #log "Activate snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
+        #(set -xe;
+        #    lvchange -ay -K "$LVM2_VG_NAME/$LV_SNAPSHOT_NAME";
+        #)
+
         CREATED_SNAPSHOT_PATHS+=( "$(lvm2_lv_path "$LV_SNAPSHOT_NAME" "$LVM2_VG_NAME")" )
+        CREATED_SNAPSHOT_VG_NAMES+=( "$LVM2_VG_NAME" )
+        CREATED_SNAPSHOT_ORIG_LV_NAMES+=( "$LVM2_LV_NAME" )
     fi
     echo;
 }
@@ -503,8 +533,10 @@ print_help() {
     echo "options:"
     echo "  -l, --list-volumes           Print list of LVM volumes"
     echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
+    echo "      --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes"
     echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
     echo "  -w, --part-rw                Add partitions in read/write mode"
+    echo "      --overwrite              Overwrite backup files"
     echo "  -p, --dest-prefix=           Destination file prefix (add / for directory)"
     echo "  -d, --debug                  Enable debug mode"
     echo "      --log-file=              Log all output and errors to the specified log file"
@@ -514,18 +546,19 @@ print_help() {
 # Main program
 
 # Check required commands
-for CMD in lvs lvcreate kpartx mount tar; do
+for CMD in lvs lvcreate kpartx mount tar awk; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
-        fatal "$cmd command is missing"
+        fatal "$CMD command is missing"
     fi
 done
-
 
 IGNORE_VOLUMES=()
 DEST_FILE_PREFIX=
 KPARTX_RW=
 DEBUG=
 LOG_FILE=
+OVERWRITE=
+IGNORE_MOUNT_ERROR=
 
 while [[ "$1" == "-"* ]]; do
     case "$1" in
@@ -572,6 +605,14 @@ while [[ "$1" == "-"* ]]; do
         KPARTX_RW=true
         shift
         ;;
+    --overwrite)
+        OVERWRITE=true
+        shift
+        ;;
+    --ignore-mount-error)
+        IGNORE_MOUNT_ERROR=true
+        shift
+        ;;
     -d|--debug)
         DEBUG=true
         shift
@@ -607,6 +648,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ -n "$LOG_FILE" ]]; then
+    message "* Log file: $LOG_FILE"
     enable_file_logging
 else
     trap cleanup EXIT
@@ -621,11 +663,16 @@ fi
 message "* Cleanup old snapshots"
 lvm2_for_each_logical_volume cleanup_old_snapshots
 
-message "* Make new snapshots"
-lvm2_for_each_logical_volume make_new_snapshots
+message "* Create new snapshots"
+lvm2_for_each_logical_volume create_new_snapshots
 
-for VOLUME_PATH in "${CREATED_SNAPSHOT_PATHS[@]}"; do
-    log "Process volume path $VOLUME_PATH"
+NUM_BACKUP_VOLUMES=${#CREATED_SNAPSHOT_PATHS[@]}
+for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
+    VOLUME_PATH=${CREATED_SNAPSHOT_PATHS[VOL_INDEX]}
+    VG_NAME=${CREATED_SNAPSHOT_VG_NAMES[VOL_INDEX]}
+    ORIG_LV_NAME=${CREATED_SNAPSHOT_ORIG_LV_NAMES[VOL_INDEX]}
+
+    log "Process snapshot volume path $VOLUME_PATH from volume $VG_NAME/$ORIG_LV_NAME"
 
     if [[ -z "$DEST_FILE_PREFIX" ]]; then
         DEST_FILE_PREFIX=./
@@ -640,7 +687,14 @@ for VOLUME_PATH in "${CREATED_SNAPSHOT_PATHS[@]}"; do
     log "Volume path: $VOLUME_PATH"
     log "Destination file prefix: $DEST_FILE_PREFIX"
 
-    KPARTX_OUT=$(kpartx -l "$VOLUME_PATH" | awk '{ print $1 }')
+    if ! KPARTX_OUT=$(kpartx -l "$VOLUME_PATH" | awk '{ print $1 }'); then
+        log "Failed: kpartx -l $VOLUME_PATH"
+        ls -la "$VOLUME_PATH" || true;
+        stat "$VOLUME_PATH" || true;
+        fatal "kpartx failed"
+    fi
+
+    dbg "KPARTX_OUT: $KPARTX_OUT"
 
     # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
     KPARTX_PARTS=()
@@ -668,32 +722,47 @@ for VOLUME_PATH in "${CREATED_SNAPSHOT_PATHS[@]}"; do
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
         for PART_NAME in "${KPARTX_PARTS[@]}"; do
+            dbg "PART_NAME: $PART_NAME"
             PART_DEV=/dev/mapper/$PART_NAME
 
             #if [[ "$KPARTX_RW" = "true" ]]; then
             #    fsck "$PART_DEV"
             #fi
 
-            if ! mount -o ro -t auto "$PART_DEV" "$MOUNT_DIR"; then
-                fatal "Could not mount partition device $PART_DEV to directory $MOUNT_DIR"
+            if mount -o ro -t auto "$PART_DEV" "$MOUNT_DIR"; then
+                MOUNT_DIR_MOUNTED=true
+
+                message "* Contents of the partition $PART_NAME:"
+                ls -lA "$MOUNT_DIR"
+
+                DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}.tar.bz2
+
+                log "Backup to file $DEST_FILE"
+
+                if [[ -e "$DEST_FILE" ]]; then
+                    dbg "OVERWRITE: $OVERWRITE"
+                    if [[ "$OVERWRITE" = "true" ]]; then
+                        log "Delete old backup file $DEST_FILE"
+                        rm -f "$DEST_FILE"
+                    else
+                        fatal "File $DEST_FILE already exists"
+                    fi
+                fi
+
+                tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
+
+                umount "$MOUNT_DIR"
+                MOUNT_DIR_MOUNTED=false
+            else
+                ERRMSG="Could not mount partition device $PART_DEV to directory $MOUNT_DIR"
+                dbg "IGNORE_MOUNT_ERROR: $IGNORE_MOUNT_ERROR"
+                if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
+                    error "$ERRMSG"
+                else
+                    fatal "$ERRMSG"
+                fi
             fi
-            MOUNT_DIR_MOUNTED=true
 
-            message "* Contents of the partition $PART_NAME:"
-            ls -lA "$MOUNT_DIR"
-
-            DEST_FILE=${DEST_FILE_PREFIX}${PART_NAME}.tar.bz2
-
-            log "Backup to file $DEST_FILE"
-
-            if [[ -e "$DEST_FILE" ]]; then
-                fatal "File $DEST_FILE already exists"
-            fi
-
-            tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
-
-            umount "$MOUNT_DIR"
-            MOUNT_DIR_MOUNTED=false
         done
 
     else
@@ -702,32 +771,50 @@ for VOLUME_PATH in "${CREATED_SNAPSHOT_PATHS[@]}"; do
         log "No partitions to mount in $VOLUME_PATH"
         log "Trying to mount a full volume as disk"
 
+        #kpartx -l "$VOLUME_PATH"; #DBG
+        #ls -lah "$VOLUME_PATH"; #DBG
+        #export VOLUME_PATH MOUNT_DIR
+        #message "Interactive"
+        #bash -i
+
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
-        if ! mount -o ro -t auto "$VOLUME_PATH" "$MOUNT_DIR"; then
-            fatal "Could not mount disk $VOLUME_PATH to directory $MOUNT_DIR"
+        if mount -o ro -t auto "$VOLUME_PATH" "$MOUNT_DIR"; then
+            MOUNT_DIR_MOUNTED=true
+
+            message "* Contents of the volume $VOLUME_PATH:"
+            ls -lA "$MOUNT_DIR"
+
+            DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}.tar.bz2
+
+            log "Backup to file $DEST_FILE"
+
+            if [[ -e "$DEST_FILE" ]]; then
+                if [[ "$OVERWRITE" = "true" ]]; then
+                    log "Delete old backup file $DEST_FILE"
+                    rm -f "$DEST_FILE"
+                else
+                    fatal "File $DEST_FILE already exists"
+                fi
+            fi
+
+            tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
+
+            umount "$MOUNT_DIR"
+            MOUNT_DIR_MOUNTED=false
+        else
+            ERRMSG="Could not mount partition device $VOLUME_PATH to directory $MOUNT_DIR"
+            dbg "IGNORE_MOUNT_ERROR: $IGNORE_MOUNT_ERROR"
+            if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
+                error "$ERRMSG"
+            else
+                fatal "$ERRMSG"
+            fi
         fi
-        MOUNT_DIR_MOUNTED=true
-
-        message "* Contents of the volume $VOLUME_PATH:"
-        ls -lA "$MOUNT_DIR"
-
-        BN=$(basename -- "$VOLUME_PATH")
-        DEST_FILE=${DEST_FILE_PREFIX}${BN}.tar.bz2
-
-        log "Backup to file $DEST_FILE"
-
-        if [[ -e "$DEST_FILE" ]]; then
-            fatal "File $DEST_FILE already exists"
-        fi
-
-        tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
-
-        umount "$MOUNT_DIR"
-        MOUNT_DIR_MOUNTED=false
     fi
 
 done
 
-echo
-echo "Created snapshot paths: ${CREATED_SNAPSHOT_PATHS[*]}"
+#echo
+#echo "Created snapshot paths: ${CREATED_SNAPSHOT_PATHS[*]}"
+message "Backup finished"
