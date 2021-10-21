@@ -553,7 +553,8 @@ print_help() {
     echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
     echo "  -w, --part-rw                Add partitions in read/write mode"
     echo "      --overwrite              Overwrite backup files"
-    echo "  -p, --dest-prefix=           Destination file prefix (add / for directory)"
+    echo "  -p, --dest-prefix=           Destination path prefix (add / at the end for directory)"
+    echo "      --rsync                  Use rsync instead of tar"
     echo "  -d, --debug                  Enable debug mode"
     echo "      --log-file=              Log all output and errors to the specified log file"
     echo "      --                       End of options"
@@ -562,19 +563,27 @@ print_help() {
 # Main program
 
 # Check required commands
-for CMD in lvs lvcreate kpartx mount tar awk; do
+for CMD in lvs lvcreate mount tar awk; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         fatal "$CMD command is missing"
     fi
 done
 
+for CMD in kpartx rsync; do
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+        warning "$CMD command is missing"
+    fi
+done
+
 IGNORE_VOLUMES=()
-DEST_FILE_PREFIX=
+DEST_PATH_PREFIX=
 KPARTX_RW=
 DEBUG=
 LOG_FILE=
 OVERWRITE=
 IGNORE_MOUNT_ERROR=
+RSYNC_MODE=
+COMPR_EXT=bz2
 
 while [[ "$1" == "-"* ]]; do
     case "$1" in
@@ -610,11 +619,11 @@ while [[ "$1" == "-"* ]]; do
         shift
         ;;
     -p|--dest-prefix)
-        DEST_FILE_PREFIX="$2"
+        DEST_PATH_PREFIX="$2"
         shift 2
         ;;
     --dest-prefix=*)
-        DEST_FILE_PREFIX="${1#*=}"
+        DEST_PATH_PREFIX="${1#*=}"
         shift
         ;;
     -w|--part-rw)
@@ -627,6 +636,10 @@ while [[ "$1" == "-"* ]]; do
         ;;
     --ignore-mount-error)
         IGNORE_MOUNT_ERROR=true
+        shift
+        ;;
+    --rsync)
+        RSYNC_MODE=true
         shift
         ;;
     -d|--debug)
@@ -676,11 +689,23 @@ if [[ "$DEBUG" == "true" ]]; then
     set -x
 fi
 
+if [[ -z "$DEST_PATH_PREFIX" ]]; then
+    DEST_PATH_PREFIX=./
+fi
+
+if [[ "$DEST_PATH_PREFIX" = */ && ! -d "$DEST_PATH_PREFIX" ]]; then
+    mkdir -p "$DEST_PATH_PREFIX"
+elif [[ -d "$DEST_PATH_PREFIX" && "$DEST_PATH_PREFIX" != */ ]]; then
+    DEST_PATH_PREFIX=$DEST_PATH_PREFIX/
+fi
+
 message "* Cleanup old snapshots"
 lvm2_for_each_logical_volume cleanup_old_snapshots
 
 message "* Create new snapshots"
 lvm2_for_each_logical_volume create_new_snapshots
+
+log "Destination path prefix: $DEST_PATH_PREFIX"
 
 NUM_BACKUP_VOLUMES=${#CREATED_SNAPSHOT_PATHS[@]}
 for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
@@ -689,19 +714,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
     ORIG_LV_NAME=${CREATED_SNAPSHOT_ORIG_LV_NAMES[VOL_INDEX]}
 
     log "Process snapshot volume path $VOLUME_PATH from volume $VG_NAME/$ORIG_LV_NAME"
-
-    if [[ -z "$DEST_FILE_PREFIX" ]]; then
-        DEST_FILE_PREFIX=./
-    fi
-
-    if [[ "$DEST_FILE_PREFIX" = */ && ! -d "$DEST_FILE_PREFIX" ]]; then
-        mkdir -p "$DEST_FILE_PREFIX"
-    elif [[ -d "$DEST_FILE_PREFIX" && "$DEST_FILE_PREFIX" != */ ]]; then
-        DEST_FILE_PREFIX=$DEST_FILE_PREFIX/
-    fi
-
     log "Volume path: $VOLUME_PATH"
-    log "Destination file prefix: $DEST_FILE_PREFIX"
 
     if ! KPARTX_OUT=$(kpartx -l "$VOLUME_PATH" | awk '{ print $1 }'); then
         log "Failed: kpartx -l $VOLUME_PATH"
@@ -727,7 +740,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
     #while IFS='' read -r line; do KPARTX_PARTS+=("$line"); done <<<"$KPARTX_OUT"
 
     mount_and_backup() {
-        local vol_path=$1 mount_dir=$2 dest_file=$3
+        local vol_path=$1 mount_dir=$2 dest_path=$3
 
         if mount -o ro -t auto "$vol_path" "$mount_dir"; then
             MOUNT_DIR_MOUNTED=true
@@ -735,18 +748,46 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
             message "* Contents of the volume $vol_path:"
             ls -lA "$MOUNT_DIR"
 
-            log "Backup to file $dest_file"
 
-            if [[ -e "$dest_file" ]]; then
-                if [[ "$OVERWRITE" = "true" ]]; then
-                    log "Delete old backup file $dest_file"
-                    rm -f "$dest_file"
+            if [[ "$RSYNC_MODE" = "true" ]]; then
+                # Rsync mode, dest_path is a directory
+                local src_dir dest_dir
+
+                if [[ "$mount_dir" = */ ]]; then
+                    src_dir=$mount_dir
                 else
-                    fatal "File $dest_file already exists"
+                    src_dir=${mount_dir}/
                 fi
-            fi
+                if [[ "$dest_path" = */ ]]; then
+                    dest_dir=$dest_path
+                else
+                    dest_dir=${dest_path}/
+                fi
 
-            tar --exclude "./lost+found" -C "$mount_dir" -cvf "$dest_file" .
+                mkdir -p "$dest_dir";
+                log "Backup with rsync from $src_dir to $dest_dir"
+                (set -xe;
+                    rsync -avzb --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+            else
+                local tar_file
+                # Tar mode, dest_path is a tar file
+                tar_file=${dest_path}.tar.${COMPR_EXT}
+
+                log "Backup to tar file $tar_file"
+
+                if [[ -e "$tar_file" ]]; then
+                    if [[ "$OVERWRITE" = "true" ]]; then
+                        log "Delete old backup file $tar_file"
+                        rm -f "$tar_file"
+                    else
+                        fatal "File $tar_file already exists"
+                    fi
+                fi
+
+                (set -xe;
+                    tar --exclude "./lost+found" -C "$mount_dir" -cvf "$tar_file" .;
+                )
+            fi
 
             umount "$mount_dir"
             MOUNT_DIR_MOUNTED=false
@@ -779,9 +820,9 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
             #    fsck "$PART_DEV"
             #fi
 
-            DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}.tar.bz2
+            DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}
 
-            mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_FILE"
+            mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_PATH"
         done
 
         rmdir "$MOUNT_DIR"
@@ -798,9 +839,9 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
 
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
-        DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}.tar.bz2
+        DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}
 
-        mount_and_backup "$VOLUME_PATH" "$MOUNT_DIR" "$DEST_FILE"
+        mount_and_backup "$VOLUME_PATH" "$MOUNT_DIR" "$DEST_PATH"
 
         rmdir "$MOUNT_DIR"
     fi
