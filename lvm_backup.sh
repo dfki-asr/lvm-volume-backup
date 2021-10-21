@@ -410,7 +410,7 @@ print_lvm_volume_info() {
 
 MOUNT_DIR=
 MOUNT_DIR_MOUNTED=
-KPARTX_PARTS_ADDED=
+KPARTX_VOLUME_PATHS=()
 
 volume_cleanup() {
     log "Volume cleanup"
@@ -421,10 +421,14 @@ volume_cleanup() {
         MOUNT_DIR_MOUNTED=false
         MOUNT_DIR=
     fi
-    if [[ "$KPARTX_PARTS_ADDED" = "true" ]]; then
+    # https://serverfault.com/questions/477503/check-if-array-is-empty-in-bash/477506
+    if (( ${#KPARTX_VOLUME_PATHS[@]} )); then
         log "Remove kpartx volumes"
-        kpartx -vd "$VOLUME_PATH" || true;
-        KPARTX_PARTS_ADDED=false
+        local vol_path
+        for vol_path in "${KPARTX_VOLUME_PATHS[@]}"; do
+            kpartx -vd "$vol_path" || true;
+        done
+        KPARTX_VOLUME_PATHS=()
     fi
 }
 
@@ -724,7 +728,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
 
     mount_and_backup() {
         local vol_path=$1 mount_dir=$2 dest_file=$3
-        
+
         if mount -o ro -t auto "$vol_path" "$mount_dir"; then
             MOUNT_DIR_MOUNTED=true
 
@@ -764,7 +768,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
             kpartx -avr "$VOLUME_PATH"
         fi
 
-        KPARTX_PARTS_ADDED=true
+        KPARTX_VOLUME_PATHS+=("$VOLUME_PATH")
 
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
@@ -780,8 +784,8 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
             mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_FILE"
         done
 
+        rmdir "$MOUNT_DIR"
     else
-        KPARTX_PARTS_ADDED=
 
         log "No partitions to mount in $VOLUME_PATH"
         log "Trying to mount a full volume as disk"
@@ -797,6 +801,8 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
         DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}.tar.bz2
 
         mount_and_backup "$VOLUME_PATH" "$MOUNT_DIR" "$DEST_FILE"
+
+        rmdir "$MOUNT_DIR"
     fi
 
 done
