@@ -7,12 +7,29 @@ unset CDPATH
 
 THIS_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
+
+log_no_echo() {
+    logger -t lvm_backup "$*"
+}
+
+log() {
+    log_no_echo "$*"
+    echo >&2 "* $*"
+}
+
 error() {
     echo >&2 "Error: $*"
+    log_no_echo "Error: $*"
+}
+
+warning() {
+    echo >&2 "Warning: $*"
+    log_no_echo "Warning: $*"
 }
 
 fatal() {
-    error "$@"
+    echo >&2 "Fatal error: $*"
+    log_no_echo "Fatal error: $*"
     echo >&2 "Exiting ..."
     exit 1
 }
@@ -23,11 +40,6 @@ message() {
 
 dbg() {
     echo >&2 "Debug: $*"
-}
-
-log() {
-    logger -t lvm_backup "$*"
-    echo >&2 "* $*"
 }
 
 enable_file_logging() {
@@ -710,6 +722,41 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
     #KPARTX_PARTS=()
     #while IFS='' read -r line; do KPARTX_PARTS+=("$line"); done <<<"$KPARTX_OUT"
 
+    mount_and_backup() {
+        local vol_path=$1 mount_dir=$2 dest_file=$3
+        
+        if mount -o ro -t auto "$vol_path" "$mount_dir"; then
+            MOUNT_DIR_MOUNTED=true
+
+            message "* Contents of the volume $vol_path:"
+            ls -lA "$MOUNT_DIR"
+
+            log "Backup to file $dest_file"
+
+            if [[ -e "$dest_file" ]]; then
+                if [[ "$OVERWRITE" = "true" ]]; then
+                    log "Delete old backup file $dest_file"
+                    rm -f "$dest_file"
+                else
+                    fatal "File $dest_file already exists"
+                fi
+            fi
+
+            tar --exclude "./lost+found" -C "$mount_dir" -cvf "$dest_file" .
+
+            umount "$mount_dir"
+            MOUNT_DIR_MOUNTED=false
+        else
+            local errmsg
+            errmsg="Could not mount partition device $vol_path to directory $mount_dir"
+            if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
+                warning "$errmsg"
+            else
+                fatal "$errmsg"
+            fi
+        fi
+    }
+
     if [[ "${#KPARTX_PARTS[@]}" -ne 0 ]]; then
         if [[ "$KPARTX_RW" = "true" ]]; then
             kpartx -av "$VOLUME_PATH"
@@ -722,47 +769,15 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
         for PART_NAME in "${KPARTX_PARTS[@]}"; do
-            dbg "PART_NAME: $PART_NAME"
             PART_DEV=/dev/mapper/$PART_NAME
 
             #if [[ "$KPARTX_RW" = "true" ]]; then
             #    fsck "$PART_DEV"
             #fi
 
-            if mount -o ro -t auto "$PART_DEV" "$MOUNT_DIR"; then
-                MOUNT_DIR_MOUNTED=true
+            DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}.tar.bz2
 
-                message "* Contents of the partition $PART_NAME:"
-                ls -lA "$MOUNT_DIR"
-
-                DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}.tar.bz2
-
-                log "Backup to file $DEST_FILE"
-
-                if [[ -e "$DEST_FILE" ]]; then
-                    dbg "OVERWRITE: $OVERWRITE"
-                    if [[ "$OVERWRITE" = "true" ]]; then
-                        log "Delete old backup file $DEST_FILE"
-                        rm -f "$DEST_FILE"
-                    else
-                        fatal "File $DEST_FILE already exists"
-                    fi
-                fi
-
-                tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
-
-                umount "$MOUNT_DIR"
-                MOUNT_DIR_MOUNTED=false
-            else
-                ERRMSG="Could not mount partition device $PART_DEV to directory $MOUNT_DIR"
-                dbg "IGNORE_MOUNT_ERROR: $IGNORE_MOUNT_ERROR"
-                if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
-                    error "$ERRMSG"
-                else
-                    fatal "$ERRMSG"
-                fi
-            fi
-
+            mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_FILE"
         done
 
     else
@@ -779,38 +794,9 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
 
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
-        if mount -o ro -t auto "$VOLUME_PATH" "$MOUNT_DIR"; then
-            MOUNT_DIR_MOUNTED=true
+        DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}.tar.bz2
 
-            message "* Contents of the volume $VOLUME_PATH:"
-            ls -lA "$MOUNT_DIR"
-
-            DEST_FILE=${DEST_FILE_PREFIX}${VG_NAME}-${ORIG_LV_NAME}.tar.bz2
-
-            log "Backup to file $DEST_FILE"
-
-            if [[ -e "$DEST_FILE" ]]; then
-                if [[ "$OVERWRITE" = "true" ]]; then
-                    log "Delete old backup file $DEST_FILE"
-                    rm -f "$DEST_FILE"
-                else
-                    fatal "File $DEST_FILE already exists"
-                fi
-            fi
-
-            tar --exclude "./lost+found" -C "$MOUNT_DIR" -cvf "$DEST_FILE" .
-
-            umount "$MOUNT_DIR"
-            MOUNT_DIR_MOUNTED=false
-        else
-            ERRMSG="Could not mount partition device $VOLUME_PATH to directory $MOUNT_DIR"
-            dbg "IGNORE_MOUNT_ERROR: $IGNORE_MOUNT_ERROR"
-            if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
-                error "$ERRMSG"
-            else
-                fatal "$ERRMSG"
-            fi
-        fi
+        mount_and_backup "$VOLUME_PATH" "$MOUNT_DIR" "$DEST_FILE"
     fi
 
 done
