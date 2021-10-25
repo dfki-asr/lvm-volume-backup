@@ -110,6 +110,17 @@ trim() {
     echo -n "$var"
 }
 
+# $1 string
+# $2 prefix
+remove_prefix() {
+    local s=$1 prefix=$2
+    if [[ "$s" == "$prefix"* ]]; then
+        printf %s "${s:${#prefix}}"
+    else
+        printf %s "$s"
+    fi
+}
+
 lvm2_attr_info() {
     local lv_attr=$1 attr
     attr="${lv_attr:0:1}"
@@ -368,8 +379,8 @@ lvm2_lv_path() {
     trim "$result"
 }
 
-DEFAULT_LV_SNAPSHOT_SUFFIX="_xsnap"
-LV_SNAPSHOT_SUFFIX="$DEFAULT_LV_SNAPSHOT_SUFFIX"
+DEFAULT_LV_SNAPSHOT_PREFIX="bak_snap_"
+LV_SNAPSHOT_PREFIX="$DEFAULT_LV_SNAPSHOT_PREFIX"
 
 lvm2_for_each_logical_volume() {
     local proc_func=$1 LVS_OUTPUT LINE_NUM LVS_LINE IFS
@@ -461,7 +472,7 @@ cleanup_old_snapshots() {
     # Cleanup of old snapshots
     if lvm2_attr_is_cow "$LVM2_LV_ATTR" || [[ -n "$LVM2_ORIGIN" ]]; then
         message "* Check snapshot $LVM2_LV_NAME / $LVM2_VG_NAME"
-        if [[ "$LVM2_LV_NAME" == *"$LV_SNAPSHOT_SUFFIX" ]]; then
+        if [[ "$LVM2_LV_NAME" == "$LV_SNAPSHOT_PREFIX"* ]]; then
             log "Remove old snapshot $LVM2_LV_PATH"
             (set -xe;
                 if ! lvremove -y "$LVM2_LV_PATH"; then
@@ -517,7 +528,7 @@ create_new_snapshots() {
         message "* Create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
         lvm2_attr_info "$LVM2_LV_ATTR"
 
-        LV_SNAPSHOT_NAME=${LVM2_LV_NAME}${LV_SNAPSHOT_SUFFIX}
+        LV_SNAPSHOT_NAME=${LV_SNAPSHOT_PREFIX}${LVM2_LV_NAME}
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
             log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
             (set -xe;
@@ -550,7 +561,7 @@ print_help() {
     echo "  -l, --list-volumes           Print list of LVM volumes"
     echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
     echo "      --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes"
-    echo "  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_SUFFIX)"
+    echo "  -s, --snapshot-prefix=       Snapshot prefix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_PREFIX)"
     echo "  -w, --part-rw                Add partitions in read/write mode"
     echo "      --overwrite              Overwrite backup files"
     echo "  -p, --dest-prefix=           Destination path prefix (add / at the end for directory)"
@@ -610,12 +621,12 @@ while [[ "$1" == "-"* ]]; do
         IGNORE_VOLUMES+=("$VOL")
         shift
         ;;
-    -s | --snapshot-suffix)
-        LV_SNAPSHOT_SUFFIX="$2"
+    -s | --snapshot-prefix)
+        LV_SNAPSHOT_PREFIX="$2"
         shift 2
         ;;
-    --snapshot-suffix=*)
-        LV_SNAPSHOT_SUFFIX="${1#*=}"
+    --snapshot-prefix=*)
+        LV_SNAPSHOT_PREFIX="${1#*=}"
         shift
         ;;
     -p|--dest-prefix)
@@ -671,6 +682,10 @@ while [[ "$1" == "-"* ]]; do
     esac
 done
 
+if [[ -z "$LV_SNAPSHOT_PREFIX" ]]; then
+    fatal "Snapshot prefix cannot be empty"
+fi
+
 if [[ $EUID -ne 0 ]]; then
     fatal "You must run this tool as root"
     # exec sudo -E "$0" "$@"
@@ -723,7 +738,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
         fatal "kpartx failed"
     fi
 
-    dbg "KPARTX_OUT: $KPARTX_OUT"
+    dbg "KPARTX_OUT: "$'\n'"$KPARTX_OUT"
 
     # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
     KPARTX_PARTS=()
@@ -767,7 +782,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
                 mkdir -p "$dest_dir";
                 log "Backup with rsync from $src_dir to $dest_dir"
                 (set -xe;
-                    rsync -avzb --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+                    rsync -avz --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
             else
                 local tar_file
                 # Tar mode, dest_path is a tar file
@@ -813,14 +828,17 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
 
         MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
 
+        COUNTER=0
         for PART_NAME in "${KPARTX_PARTS[@]}"; do
             PART_DEV=/dev/mapper/$PART_NAME
+            : $(( COUNTER++ ))
 
             #if [[ "$KPARTX_RW" = "true" ]]; then
             #    fsck "$PART_DEV"
             #fi
 
-            DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}
+            # DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}
+            DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${COUNTER}
 
             mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_PATH"
         done
