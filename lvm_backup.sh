@@ -475,7 +475,7 @@ cleanup_old_snapshots() {
 }
 
 create_new_snapshots() {
-    local CREATE_SNAPSHOT=true ERR ivol
+    local create_snapshot=true err ivol
 
     for ivol in "${IGNORE_VOLUMES[@]}"; do
         if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
@@ -485,34 +485,34 @@ create_new_snapshots() {
     done
 
     if lvm2_attr_is_cow "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR=snapshots
+        create_snapshot=false
+        err=snapshots
     elif lvm2_attr_is_locked "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="locked volumes"
+        create_snapshot=false
+        err="locked volumes"
     elif lvm2_attr_is_pvmove "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="pvmoved volumes"
+        create_snapshot=false
+        err="pvmoved volumes"
     elif lvm2_attr_is_merging_origin "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="an origin that has a merging snapshot"
+        create_snapshot=false
+        err="an origin that has a merging snapshot"
     elif lvm2_attr_is_any_cache "$LVM2_LV_ATTR"; then
         # Actually, this is too strict, because snapshots can be taken from caches
-        CREATE_SNAPSHOT=false
-        ERR="cache"
+        create_snapshot=false
+        err="cache"
     elif lvm2_attr_is_thin_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_thin_volume "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="thin pool type volumes"
+        create_snapshot=false
+        err="thin pool type volumes"
     elif lvm2_attr_is_mirror_type_or_pvmove "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="mirror subvolumes or mirrors"
+        create_snapshot=false
+        err="mirror subvolumes or mirrors"
     elif lvm2_attr_is_raid_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_raid "$LVM2_LV_ATTR"; then
-        CREATE_SNAPSHOT=false
-        ERR="raid subvolumes";
+        create_snapshot=false
+        err="raid subvolumes";
     fi
 
-    if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
-        message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $ERR are not supported."
+    if [[ "$create_snapshot" = "false" ]]; then
+        message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $err are not supported."
     else
         message "* Create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
         lvm2_attr_info "$LVM2_LV_ATTR"
