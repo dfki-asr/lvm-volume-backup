@@ -738,7 +738,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
         fatal "kpartx failed"
     fi
 
-    dbg "KPARTX_OUT: "$'\n'"$KPARTX_OUT"
+    # dbg "KPARTX_OUT: "$'\n'"$KPARTX_OUT"
 
     # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
     KPARTX_PARTS=()
