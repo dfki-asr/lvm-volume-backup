@@ -84,9 +84,21 @@ $errmsg"
         fi
     }
 
-    trap 'on_error ${LINENO} "${BASH_COMMAND}" "${?}"' ERR
+    trap 'on_error "${LINENO}" "${BASH_COMMAND}" "${?}"' ERR
 
     on_exit() {
+        local errmsg err_lineno err_funcname err_command err_code
+        err_lineno="${1}"
+        err_funcname="${2}"
+        err_command="${3}"
+        err_code="${4:-0}"
+
+        if ((err_code)); then
+            errmsg=$(awk 'NR>L-4 && NR<L+4 { printf "%-5d%3s%s\n",NR,(NR==L?">>>":""),$0 }' L="$err_lineno" "$0")
+            log "Error occurred in '$err_command' command (function $err_funcname, line $err_lineno)
+$errmsg"
+        fi
+
         cleanup
         log "${BASH_SOURCE[0]}: exiting"
         # Close STDOUT file descriptor
@@ -95,7 +107,7 @@ $errmsg"
         exec 2<&-
     }
 
-    trap 'on_exit' EXIT
+    trap 'on_exit "${LINENO}" "${FUNCNAME}" "${BASH_COMMAND}" "${?}"' EXIT
 }
 ### END LOGGING
 
