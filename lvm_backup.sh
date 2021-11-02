@@ -394,6 +394,7 @@ lvm2_lv_path() {
 DEFAULT_LV_SNAPSHOT_PREFIX="bak_snap_"
 LV_SNAPSHOT_PREFIX="$DEFAULT_LV_SNAPSHOT_PREFIX"
 
+
 lvm2_for_each_logical_volume() {
     local proc_func=$1 LVS_OUTPUT LINE_NUM LVS_LINE IFS
     local LVM2_LV_NAME LVM2_VG_NAME LVM2_LV_PATH LVM2_LV_SIZE LVM2_LV_ATTR LVM2_SEGTYPE LVM2_ORIGIN
@@ -401,7 +402,8 @@ lvm2_for_each_logical_volume() {
         error "Callback function name is required"
         return 1
     fi
-    LVS_OUTPUT=$(/sbin/lvs  --noheadings --separator='|' --units b --o lv_name,vg_name,lv_path,lv_size,lv_attr,origin,segtype)
+    # Note: lvs may display the same volume multiple times for unclear reasons
+    LVS_OUTPUT=$(/sbin/lvs  --noheadings --separator='|' --units b --o lv_name,vg_name,lv_path,lv_size,lv_attr,origin,segtype | sort -u)
     LINE_NUM=0
 
     while IFS='' read -r LVS_LINE; do
@@ -586,7 +588,7 @@ print_help() {
 # Main program
 
 # Check required commands
-for CMD in lvs lvcreate mount tar awk; do
+for CMD in lvs lvcreate mount tar awk sort; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         fatal "$CMD command is missing"
     fi
