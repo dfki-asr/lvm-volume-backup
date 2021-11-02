@@ -782,7 +782,7 @@ for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
                 mkdir -p "$dest_dir";
                 log "Backup with rsync from $src_dir to $dest_dir"
                 (set -xe;
-                    rsync -avz --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+                    rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
             else
                 local tar_file
                 # Tar mode, dest_path is a tar file
