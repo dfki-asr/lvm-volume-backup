@@ -7,7 +7,6 @@ unset CDPATH
 
 THIS_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
-
 log_no_echo() {
     logger -t lvm_backup "$*"
 }
@@ -43,20 +42,20 @@ dbg() {
 }
 
 enable_file_logging() {
-    if [[ -z "$LOG_FILE" ]]; then
-        fatal "The LOG_FILE variable must not be empty."
+    if [[ -z "$OPT_LOG_FILE" ]]; then
+        fatal "The OPT_LOG_FILE variable must not be empty."
     fi
 
-    exec > >(tee -ia "$LOG_FILE")
-    exec 2> >(tee -ia "$LOG_FILE" >&2)
+    exec > >(tee -ia "$OPT_LOG_FILE")
+    exec 2> >(tee -ia "$OPT_LOG_FILE" >&2)
 
     ## Close STDOUT file descriptor
     #exec 1<&-
     ## Close STDERR FD
     #exec 2<&-
 
-    ## Open STDOUT as $LOG_FILE file for read and write.
-    #exec 1>>"$LOG_FILE" 2>&1
+    ## Open STDOUT as $OPT_LOG_FILE file for read and write.
+    #exec 1>>"$OPT_LOG_FILE" 2>&1
 
     echo
     echo "$(date): ${BASH_SOURCE[0]}: start logging"
@@ -392,28 +391,28 @@ lvm2_lv_path() {
 }
 
 DEFAULT_LV_SNAPSHOT_PREFIX="bak_snap_"
-LV_SNAPSHOT_PREFIX="$DEFAULT_LV_SNAPSHOT_PREFIX"
+OPT_LV_SNAPSHOT_PREFIX="$DEFAULT_LV_SNAPSHOT_PREFIX"
 
 
 lvm2_for_each_logical_volume() {
-    local proc_func=$1 LVS_OUTPUT LINE_NUM LVS_LINE IFS
+    local proc_func=$1 lvs_output line_num lvs_line IFS
     local LVM2_LV_NAME LVM2_VG_NAME LVM2_LV_PATH LVM2_LV_SIZE LVM2_LV_ATTR LVM2_SEGTYPE LVM2_ORIGIN
     if [[ -z "$proc_func" ]]; then
         error "Callback function name is required"
         return 1
     fi
     # Note: lvs may display the same volume multiple times for unclear reasons
-    LVS_OUTPUT=$(/sbin/lvs  --noheadings --separator='|' --units b --o lv_name,vg_name,lv_path,lv_size,lv_attr,origin,segtype | sort -u)
-    LINE_NUM=0
+    lvs_output=$(/sbin/lvs  --noheadings --separator='|' --units b --o lv_name,vg_name,lv_path,lv_size,lv_attr,origin,segtype | sort -u)
+    line_num=0
 
-    while IFS='' read -r LVS_LINE; do
-        : $((LINE_NUM++))
-        #echo "Accessing line $LINE_NUM: ${LVS_LINE}";
+    while IFS='' read -r lvs_line; do
+        : $((line_num++))
+        #echo "Accessing line $line_num: ${lvs_line}";
 
-        LVS_LINE=$(trim "$LVS_LINE")
-        IFS='|' read -r LVM2_LV_NAME LVM2_VG_NAME LVM2_LV_PATH LVM2_LV_SIZE LVM2_LV_ATTR LVM2_ORIGIN LVM2_SEGTYPE <<<"$LVS_LINE"
+        lvs_line=$(trim "$lvs_line")
+        IFS='|' read -r LVM2_LV_NAME LVM2_VG_NAME LVM2_LV_PATH LVM2_LV_SIZE LVM2_LV_ATTR LVM2_ORIGIN LVM2_SEGTYPE <<<"$lvs_line"
         "$proc_func" "$LVM2_LV_NAME" "$LVM2_VG_NAME" "$LVM2_LV_PATH" "$LVM2_LV_SIZE" "$LVM2_LV_ATTR" "$LVM2_ORIGIN" "$LVM2_SEGTYPE"
-    done <<< "$LVS_OUTPUT"
+    done <<< "$lvs_output"
 }
 
 check_root() {
@@ -432,53 +431,52 @@ print_lvm_volume_info() {
     echo
 }
 
+remove_snapshot() {
+    local snapshot_path=$1
+    log "Remove snapshot $snapshot_path"
+    (set -xe;
+        if ! lvremove -y "$snapshot_path"; then
+            # Try to remove kpartx mapping
+            kpartx -vd "$snapshot_path" || true;
+            lvremove -y "$snapshot_path" || true;
+        fi
+    )
+}
 
-MOUNT_DIR=
-MOUNT_DIR_MOUNTED=
-KPARTX_VOLUME_PATHS=()
+# CL_ - global cleanup variables
+CL_MOUNT_DIR=
+CL_KPARTX_VOLUME_PATHS=()
 
 volume_cleanup() {
     log "Volume cleanup"
-    if [[ -n "$MOUNT_DIR" && "$MOUNT_DIR_MOUNTED" = "true" ]]; then
-        log "Unmounting $MOUNT_DIR"
-        umount "$MOUNT_DIR" || true;
-        rmdir "$MOUNT_DIR" || true;
-        MOUNT_DIR_MOUNTED=false
-        MOUNT_DIR=
+    if [[ -n "$CL_MOUNT_DIR" ]]; then
+        log "Unmounting $CL_MOUNT_DIR"
+        umount "$CL_MOUNT_DIR" || true;
+        rmdir "$CL_MOUNT_DIR" || true;
+        CL_MOUNT_DIR=
     fi
     # https://serverfault.com/questions/477503/check-if-array-is-empty-in-bash/477506
-    if (( ${#KPARTX_VOLUME_PATHS[@]} )); then
+    if (( ${#CL_KPARTX_VOLUME_PATHS[@]} )); then
         log "Remove kpartx volumes"
         local vol_path
-        for vol_path in "${KPARTX_VOLUME_PATHS[@]}"; do
+        for vol_path in "${CL_KPARTX_VOLUME_PATHS[@]}"; do
             kpartx -vd "$vol_path" || true;
         done
-        KPARTX_VOLUME_PATHS=()
+        CL_KPARTX_VOLUME_PATHS=()
     fi
 }
 
-CREATED_SNAPSHOT_PATHS=()
-CREATED_SNAPSHOT_VG_NAMES=()
-CREATED_SNAPSHOT_ORIG_LV_NAMES=()
+CL_SNAPSHOT_PATHS=()
 
 cleanup() {
     local snapshot_path
     log "Cleanup"
     volume_cleanup
     log "Remove created snapshots"
-    for snapshot_path in "${CREATED_SNAPSHOT_PATHS[@]}"; do
-        log "Remove snapshot $snapshot_path"
-        (set -xe;
-            if ! lvremove -y "$snapshot_path"; then
-                # Try to remove kpartx mapping
-                kpartx -vd "$snapshot_path" || true;
-                lvremove -y "$snapshot_path" || true;
-            fi
-        )
+    for snapshot_path in "${CL_SNAPSHOT_PATHS[@]}"; do
+        remove_snapshot "$snapshot_path"
     done
-    CREATED_SNAPSHOT_PATHS=()
-    CREATED_SNAPSHOT_VG_NAMES=()
-    CREATED_SNAPSHOT_ORIG_LV_NAMES=()
+    CL_SNAPSHOT_PATHS=()
     log "End backup of LVM volumes"
 }
 
@@ -486,7 +484,7 @@ cleanup_old_snapshots() {
     # Cleanup of old snapshots
     if lvm2_attr_is_cow "$LVM2_LV_ATTR" || [[ -n "$LVM2_ORIGIN" ]]; then
         message "* Check snapshot $LVM2_LV_NAME / $LVM2_VG_NAME"
-        if [[ "$LVM2_LV_NAME" == "$LV_SNAPSHOT_PREFIX"* ]]; then
+        if [[ "$LVM2_LV_NAME" == "$OPT_LV_SNAPSHOT_PREFIX"* ]]; then
             log "Remove old snapshot $LVM2_LV_PATH"
             (set -xe;
                 if ! lvremove -y "$LVM2_LV_PATH"; then
@@ -499,10 +497,151 @@ cleanup_old_snapshots() {
     fi
 }
 
-create_new_snapshots() {
+mount_and_backup() {
+    local vol_path=$1 mount_dir=$2 dest_path=$3
+
+    if mount -o ro -t auto "$vol_path" "$mount_dir"; then
+        CL_MOUNT_DIR=$mount_dir
+
+        message "* Contents of the volume $vol_path:"
+        ls -lA "$mount_dir"
+
+        if [[ "$OPT_RSYNC_MODE" = "true" ]]; then
+            # Rsync mode, dest_path is a directory
+            local src_dir dest_dir
+
+            if [[ "$mount_dir" = */ ]]; then
+                src_dir=$mount_dir
+            else
+                src_dir=${mount_dir}/
+            fi
+            if [[ "$dest_path" = */ ]]; then
+                dest_dir=$dest_path
+            else
+                dest_dir=${dest_path}/
+            fi
+
+            mkdir -p "$dest_dir";
+            log "Backup with rsync from $src_dir to $dest_dir"
+            (set -xe;
+                rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+        else
+            local tar_file
+            # Tar mode, dest_path is a tar file
+            tar_file=${dest_path}.tar.${OPT_COMPR_EXT}
+
+            log "Backup to tar file $tar_file"
+
+            if [[ -e "$tar_file" ]]; then
+                if [[ "$OPT_OVERWRITE" = "true" ]]; then
+                    log "Delete old backup file $tar_file"
+                    rm -f "$tar_file"
+                else
+                    fatal "File $tar_file already exists"
+                fi
+            fi
+
+            (set -xe;
+                tar --exclude "./lost+found" -C "$mount_dir" -cvf "$tar_file" .;
+            )
+        fi
+
+        umount "$mount_dir"
+        CL_MOUNT_DIR=
+    else
+        local errmsg
+        errmsg="Could not mount partition device $vol_path to directory $mount_dir"
+        if [[ "$OPT_IGNORE_MOUNT_ERROR" = "true" ]]; then
+            warning "$errmsg"
+        else
+            fatal "$errmsg"
+        fi
+    fi
+}
+
+backup_snapshot() {
+    local volume_path=$1  vg_name=$2 orig_lv_name=$3
+
+    log "Process snapshot volume path $volume_path from volume $vg_name/$orig_lv_name"
+    log "Volume path: $volume_path"
+
+    local kpartx_out
+    if ! kpartx_out=$(kpartx -l "$volume_path" | awk '{ print $1 }'); then
+        log "Failed: kpartx -l $volume_path"
+        ls -la "$volume_path" || true;
+        stat "$volume_path" || true;
+        fatal "kpartx failed"
+    fi
+
+    # dbg "kpartx_out: "$'\n'"$kpartx_out"
+
+    # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
+    local kpartx_parts=() kpartx_part
+    while IFS= read -r kpartx_part; do
+        if [[ -n "$kpartx_part" && "$kpartx_part" != [[:space:]]* ]]; then
+            kpartx_parts+=("$kpartx_part")
+        fi
+    done <<<"$kpartx_out"
+    if [[ -n "$kpartx_part" && "$kpartx_part" != [[:space:]]* ]]; then
+        kpartx_parts+=("$kpartx_part")
+    fi
+
+    #kpartx_parts=()
+    #while IFS='' read -r line; do kpartx_parts+=("$line"); done <<<"$kpartx_out"
+    if [[ "${#kpartx_parts[@]}" -ne 0 ]]; then
+        if [[ "$OPT_KPARTX_RW" = "true" ]]; then
+            kpartx -av "$volume_path"
+        else
+            kpartx -avr "$volume_path"
+        fi
+
+        CL_KPARTX_VOLUME_PATHS+=("$volume_path")
+
+        local mount_dir counter part_name part_dev dest_path
+        mount_dir=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
+
+        counter=0
+        for part_name in "${kpartx_parts[@]}"; do
+            part_dev=/dev/mapper/$part_name
+            : $(( counter++ ))
+
+            #if [[ "$OPT_KPARTX_RW" = "true" ]]; then
+            #    fsck "$part_dev"
+            #fi
+
+            # dest_path=${OPT_DEST_PATH_PREFIX}${vg_name}-${orig_lv_name}-${part_name}
+            dest_path=${OPT_DEST_PATH_PREFIX}${vg_name}-${orig_lv_name}-${counter}
+
+            mount_and_backup "$part_dev" "$mount_dir" "$dest_path"
+        done
+
+        rmdir "$mount_dir"
+    else
+
+        log "No partitions to mount in $volume_path"
+        log "Trying to mount a full volume as disk"
+
+        #kpartx -l "$volume_path"; #DBG
+        #ls -lah "$volume_path"; #DBG
+        #export volume_path mount_dir
+        #message "Interactive"
+        #bash -i
+
+        local mount_dir dest_path
+        mount_dir=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
+
+        dest_path=${OPT_DEST_PATH_PREFIX}${vg_name}-${orig_lv_name}
+
+        mount_and_backup "$volume_path" "$mount_dir" "$dest_path"
+
+        rmdir "$mount_dir"
+    fi
+}
+
+create_and_backup_snapshots() {
     local create_snapshot=true err ivol
 
-    for ivol in "${IGNORE_VOLUMES[@]}"; do
+    for ivol in "${OPT_IGNORE_VOLUMES[@]}"; do
         if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
             log "Ignore volume $ivol"
             return 0
@@ -542,27 +681,35 @@ create_new_snapshots() {
         message "* Create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
         lvm2_attr_info "$LVM2_LV_ATTR"
 
-        LV_SNAPSHOT_NAME=${LV_SNAPSHOT_PREFIX}${LVM2_LV_NAME}
+        local lv_snapshot_name=${OPT_LV_SNAPSHOT_PREFIX}${LVM2_LV_NAME}
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
-            log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
+            log "Create snapshot $LVM2_VG_NAME/$lv_snapshot_name"
             (set -xe;
-                lvcreate -s -n "$LV_SNAPSHOT_NAME" -kn "$LVM2_LV_PATH";
+                lvcreate -s -n "$lv_snapshot_name" -kn "$LVM2_LV_PATH";
             )
         else
-            log "Create snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
+            log "Create snapshot $LVM2_VG_NAME/$lv_snapshot_name"
             (set -xe;
-                lvcreate -l50%FREE -s -n "$LV_SNAPSHOT_NAME" -kn "$LVM2_LV_PATH";
+                lvcreate -l50%FREE -s -n "$lv_snapshot_name" -kn "$LVM2_LV_PATH";
             )
         fi
 
-        #log "Activate snapshot $LVM2_VG_NAME/$LV_SNAPSHOT_NAME"
+        #log "Activate snapshot $LVM2_VG_NAME/$lv_snapshot_name"
         #(set -xe;
-        #    lvchange -ay -K "$LVM2_VG_NAME/$LV_SNAPSHOT_NAME";
+        #    lvchange -ay -K "$LVM2_VG_NAME/$lv_snapshot_name";
         #)
 
-        CREATED_SNAPSHOT_PATHS+=( "$(lvm2_lv_path "$LV_SNAPSHOT_NAME" "$LVM2_VG_NAME")" )
-        CREATED_SNAPSHOT_VG_NAMES+=( "$LVM2_VG_NAME" )
-        CREATED_SNAPSHOT_ORIG_LV_NAMES+=( "$LVM2_LV_NAME" )
+        local snapshot_path=$(lvm2_lv_path "$lv_snapshot_name" "$LVM2_VG_NAME")
+
+        # Save snapshot path in case of fatal error in cleanup variable
+        CL_SNAPSHOT_PATHS+=( "$snapshot_path" )
+
+        backup_snapshot "$snapshot_path" "$LVM2_VG_NAME" "$LVM2_LV_NAME"
+
+        remove_snapshot "$snapshot_path"
+
+        # Remove snapshot path from the cleanup variable
+        unset 'CL_SNAPSHOT_PATHS[${#CL_SNAPSHOT_PATHS[@]}-1]'
     fi
     echo;
 }
@@ -600,15 +747,15 @@ for CMD in kpartx rsync; do
     fi
 done
 
-IGNORE_VOLUMES=()
-DEST_PATH_PREFIX=
-KPARTX_RW=
-DEBUG=
-LOG_FILE=
-OVERWRITE=
-IGNORE_MOUNT_ERROR=
-RSYNC_MODE=
-COMPR_EXT=bz2
+OPT_IGNORE_VOLUMES=()
+OPT_DEST_PATH_PREFIX=
+OPT_KPARTX_RW=
+OPT_DEBUG=
+OPT_LOG_FILE=
+OPT_OVERWRITE=
+OPT_IGNORE_MOUNT_ERROR=
+OPT_RSYNC_MODE=
+OPT_COMPR_EXT=bz2
 
 while [[ "$1" == "-"* ]]; do
     case "$1" in
@@ -623,7 +770,7 @@ while [[ "$1" == "-"* ]]; do
         if [[ ${#VOL_GRP_NAME[@]} -ne 2 ]]; then
             fatal "Volume name '$VOL' must be in format VOLUME_GROUP/VOLUME_NAME"
         fi
-        IGNORE_VOLUMES+=("$VOL")
+        OPT_IGNORE_VOLUMES+=("$VOL")
         shift 2
         ;;
     --ignore-volume=*)
@@ -632,51 +779,51 @@ while [[ "$1" == "-"* ]]; do
         if [[ ${#VOL_GRP_NAME[@]} -ne 2 ]]; then
             fatal "Volume name '$VOL' must be in format VOLUME_GROUP/VOLUME_NAME"
         fi
-        IGNORE_VOLUMES+=("$VOL")
+        OPT_IGNORE_VOLUMES+=("$VOL")
         shift
         ;;
     -s | --snapshot-prefix)
-        LV_SNAPSHOT_PREFIX="$2"
+        OPT_LV_SNAPSHOT_PREFIX="$2"
         shift 2
         ;;
     --snapshot-prefix=*)
-        LV_SNAPSHOT_PREFIX="${1#*=}"
+        OPT_LV_SNAPSHOT_PREFIX="${1#*=}"
         shift
         ;;
     -p|--dest-prefix)
-        DEST_PATH_PREFIX="$2"
+        OPT_DEST_PATH_PREFIX="$2"
         shift 2
         ;;
     --dest-prefix=*)
-        DEST_PATH_PREFIX="${1#*=}"
+        OPT_DEST_PATH_PREFIX="${1#*=}"
         shift
         ;;
     -w|--part-rw)
-        KPARTX_RW=true
+        OPT_KPARTX_RW=true
         shift
         ;;
     --overwrite)
-        OVERWRITE=true
+        OPT_OVERWRITE=true
         shift
         ;;
     --ignore-mount-error)
-        IGNORE_MOUNT_ERROR=true
+        OPT_IGNORE_MOUNT_ERROR=true
         shift
         ;;
     --rsync)
-        RSYNC_MODE=true
+        OPT_RSYNC_MODE=true
         shift
         ;;
     -d|--debug)
-        DEBUG=true
+        OPT_DEBUG=true
         shift
         ;;
     --log-file)
-        LOG_FILE="$2"
+        OPT_LOG_FILE="$2"
         shift 2
         ;;
     --log-file=*)
-        LOG_FILE="${1#*=}"
+        OPT_LOG_FILE="${1#*=}"
         shift
         ;;
     --help)
@@ -696,7 +843,7 @@ while [[ "$1" == "-"* ]]; do
     esac
 done
 
-if [[ -z "$LV_SNAPSHOT_PREFIX" ]]; then
+if [[ -z "$OPT_LV_SNAPSHOT_PREFIX" ]]; then
     fatal "Snapshot prefix cannot be empty"
 fi
 
@@ -705,8 +852,8 @@ if [[ $EUID -ne 0 ]]; then
     # exec sudo -E "$0" "$@"
 fi
 
-if [[ -n "$LOG_FILE" ]]; then
-    message "* Log file: $LOG_FILE"
+if [[ -n "$OPT_LOG_FILE" ]]; then
+    message "* Log file: $OPT_LOG_FILE"
     enable_file_logging
 else
     trap cleanup EXIT
@@ -714,172 +861,26 @@ fi
 
 log "Start backup of LVM volumes"
 
-if [[ "$DEBUG" == "true" ]]; then
+if [[ "$OPT_DEBUG" == "true" ]]; then
     set -x
 fi
 
-if [[ -z "$DEST_PATH_PREFIX" ]]; then
-    DEST_PATH_PREFIX=./
+if [[ -z "$OPT_DEST_PATH_PREFIX" ]]; then
+    OPT_DEST_PATH_PREFIX=./
 fi
 
-if [[ "$DEST_PATH_PREFIX" = */ && ! -d "$DEST_PATH_PREFIX" ]]; then
-    mkdir -p "$DEST_PATH_PREFIX"
-elif [[ -d "$DEST_PATH_PREFIX" && "$DEST_PATH_PREFIX" != */ ]]; then
-    DEST_PATH_PREFIX=$DEST_PATH_PREFIX/
+if [[ "$OPT_DEST_PATH_PREFIX" = */ && ! -d "$OPT_DEST_PATH_PREFIX" ]]; then
+    mkdir -p "$OPT_DEST_PATH_PREFIX"
+elif [[ -d "$OPT_DEST_PATH_PREFIX" && "$OPT_DEST_PATH_PREFIX" != */ ]]; then
+    OPT_DEST_PATH_PREFIX=$OPT_DEST_PATH_PREFIX/
 fi
 
 message "* Cleanup old snapshots"
 lvm2_for_each_logical_volume cleanup_old_snapshots
 
-message "* Create new snapshots"
-lvm2_for_each_logical_volume create_new_snapshots
+log "Destination path prefix: $OPT_DEST_PATH_PREFIX"
 
-log "Destination path prefix: $DEST_PATH_PREFIX"
+message "* Create and backup snapshots"
+lvm2_for_each_logical_volume create_and_backup_snapshots
 
-NUM_BACKUP_VOLUMES=${#CREATED_SNAPSHOT_PATHS[@]}
-for ((VOL_INDEX=0; VOL_INDEX<NUM_BACKUP_VOLUMES; ++VOL_INDEX)); do
-    VOLUME_PATH=${CREATED_SNAPSHOT_PATHS[VOL_INDEX]}
-    VG_NAME=${CREATED_SNAPSHOT_VG_NAMES[VOL_INDEX]}
-    ORIG_LV_NAME=${CREATED_SNAPSHOT_ORIG_LV_NAMES[VOL_INDEX]}
-
-    log "Process snapshot volume path $VOLUME_PATH from volume $VG_NAME/$ORIG_LV_NAME"
-    log "Volume path: $VOLUME_PATH"
-
-    if ! KPARTX_OUT=$(kpartx -l "$VOLUME_PATH" | awk '{ print $1 }'); then
-        log "Failed: kpartx -l $VOLUME_PATH"
-        ls -la "$VOLUME_PATH" || true;
-        stat "$VOLUME_PATH" || true;
-        fatal "kpartx failed"
-    fi
-
-    # dbg "KPARTX_OUT: "$'\n'"$KPARTX_OUT"
-
-    # http://mywiki.wooledge.org/BashFAQ/005#Loading_lines_from_a_file_or_stream
-    KPARTX_PARTS=()
-    while IFS= read -r; do
-        if [[ -n "$REPLY" && "$REPLY" != [[:space:]]* ]]; then
-            KPARTX_PARTS+=("$REPLY")
-        fi
-    done <<<"$KPARTX_OUT"
-    if [[ -n "$REPLY" && "$REPLY" != [[:space:]]* ]]; then
-        KPARTX_PARTS+=("$REPLY")
-    fi
-
-    #KPARTX_PARTS=()
-    #while IFS='' read -r line; do KPARTX_PARTS+=("$line"); done <<<"$KPARTX_OUT"
-
-    mount_and_backup() {
-        local vol_path=$1 mount_dir=$2 dest_path=$3
-
-        if mount -o ro -t auto "$vol_path" "$mount_dir"; then
-            MOUNT_DIR_MOUNTED=true
-
-            message "* Contents of the volume $vol_path:"
-            ls -lA "$MOUNT_DIR"
-
-
-            if [[ "$RSYNC_MODE" = "true" ]]; then
-                # Rsync mode, dest_path is a directory
-                local src_dir dest_dir
-
-                if [[ "$mount_dir" = */ ]]; then
-                    src_dir=$mount_dir
-                else
-                    src_dir=${mount_dir}/
-                fi
-                if [[ "$dest_path" = */ ]]; then
-                    dest_dir=$dest_path
-                else
-                    dest_dir=${dest_path}/
-                fi
-
-                mkdir -p "$dest_dir";
-                log "Backup with rsync from $src_dir to $dest_dir"
-                (set -xe;
-                    rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
-            else
-                local tar_file
-                # Tar mode, dest_path is a tar file
-                tar_file=${dest_path}.tar.${COMPR_EXT}
-
-                log "Backup to tar file $tar_file"
-
-                if [[ -e "$tar_file" ]]; then
-                    if [[ "$OVERWRITE" = "true" ]]; then
-                        log "Delete old backup file $tar_file"
-                        rm -f "$tar_file"
-                    else
-                        fatal "File $tar_file already exists"
-                    fi
-                fi
-
-                (set -xe;
-                    tar --exclude "./lost+found" -C "$mount_dir" -cvf "$tar_file" .;
-                )
-            fi
-
-            umount "$mount_dir"
-            MOUNT_DIR_MOUNTED=false
-        else
-            local errmsg
-            errmsg="Could not mount partition device $vol_path to directory $mount_dir"
-            if [[ "$IGNORE_MOUNT_ERROR" = "true" ]]; then
-                warning "$errmsg"
-            else
-                fatal "$errmsg"
-            fi
-        fi
-    }
-
-    if [[ "${#KPARTX_PARTS[@]}" -ne 0 ]]; then
-        if [[ "$KPARTX_RW" = "true" ]]; then
-            kpartx -av "$VOLUME_PATH"
-        else
-            kpartx -avr "$VOLUME_PATH"
-        fi
-
-        KPARTX_VOLUME_PATHS+=("$VOLUME_PATH")
-
-        MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
-
-        COUNTER=0
-        for PART_NAME in "${KPARTX_PARTS[@]}"; do
-            PART_DEV=/dev/mapper/$PART_NAME
-            : $(( COUNTER++ ))
-
-            #if [[ "$KPARTX_RW" = "true" ]]; then
-            #    fsck "$PART_DEV"
-            #fi
-
-            # DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${PART_NAME}
-            DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}-${COUNTER}
-
-            mount_and_backup "$PART_DEV" "$MOUNT_DIR" "$DEST_PATH"
-        done
-
-        rmdir "$MOUNT_DIR"
-    else
-
-        log "No partitions to mount in $VOLUME_PATH"
-        log "Trying to mount a full volume as disk"
-
-        #kpartx -l "$VOLUME_PATH"; #DBG
-        #ls -lah "$VOLUME_PATH"; #DBG
-        #export VOLUME_PATH MOUNT_DIR
-        #message "Interactive"
-        #bash -i
-
-        MOUNT_DIR=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
-
-        DEST_PATH=${DEST_PATH_PREFIX}${VG_NAME}-${ORIG_LV_NAME}
-
-        mount_and_backup "$VOLUME_PATH" "$MOUNT_DIR" "$DEST_PATH"
-
-        rmdir "$MOUNT_DIR"
-    fi
-
-done
-
-#echo
-#echo "Created snapshot paths: ${CREATED_SNAPSHOT_PATHS[*]}"
 message "Backup finished"
