@@ -1,4 +1,4 @@
-LVM Volume Backup Tools 
+LVM Volume Backup Tools
 =======================
 
 ## Introduction
@@ -15,7 +15,7 @@ options:
   -l, --list-volumes           Print list of LVM volumes
   -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME
       --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes
-  -s, --snapshot-suffix=       Snapshot suffix used for backup snapshots (default: _xsnap)
+  -s, --snapshot-prefix=       Snapshot prefix used for backup snapshots (default: bak_snap_)
   -w, --part-rw                Add partitions in read/write mode
       --overwrite              Overwrite backup files
   -p, --dest-prefix=           Destination path prefix (add / at the end for directory)
