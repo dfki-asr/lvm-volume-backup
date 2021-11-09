@@ -430,8 +430,21 @@ list_volumes() {
 # Set variables CREATE_SNAPSHOT, SNAPSHOT_ERROR_REASON
 _volume_check() {
     local ivol
-    CREATE_SNAPSHOT=true
     SNAPSHOT_ERROR_REASON=
+
+    if (( ${#OPT_BACKUP_VOLUMES[@]} )); then
+        CREATE_SNAPSHOT=false
+        for ivol in "${OPT_BACKUP_VOLUMES[@]}"; do
+            if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
+                CREATE_SNAPSHOT=true
+            fi
+        done
+        if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
+            return 0
+        fi
+    else
+        CREATE_SNAPSHOT=true
+    fi
 
     for ivol in "${OPT_IGNORE_VOLUMES[@]}"; do
         if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
@@ -758,6 +771,8 @@ print_help() {
     echo "  -l, --list-volumes           Print list of LVM volumes"
     echo "  -c, --cleanup                Remove old snapshots created by this tool but not deleted due to an error."
     echo "                               No backup is performed after the cleanup"
+    echo "  -b, --backup-volume=         Backup volume specified in format VOLUME_GROUP/VOLUME_NAME."
+    echo "                               If no backup volumes are specified, all found volumes will be backed up"
     echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
     echo "      --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes"
     echo "  -s, --snapshot-prefix=       Snapshot prefix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_PREFIX)"
@@ -785,6 +800,7 @@ for CMD in kpartx rsync; do
     fi
 done
 
+OPT_BACKUP_VOLUMES=()
 OPT_IGNORE_VOLUMES=()
 OPT_CLEANUP=
 OPT_DEST_PATH_PREFIX=
@@ -805,6 +821,24 @@ while [[ "$1" == "-"* ]]; do
         ;;
     -c | --cleanup)
         OPT_CLEANUP=true
+        shift
+        ;;
+    -b | --backup-volume)
+        VOL="$2"
+        IFS='/' read -ra VOL_GRP_NAME <<< "$VOL"
+        if [[ ${#VOL_GRP_NAME[@]} -ne 2 ]]; then
+            fatal "Volume name '$VOL' must be in format VOLUME_GROUP/VOLUME_NAME"
+        fi
+        OPT_BACKUP_VOLUMES+=("$VOL")
+        shift 2
+        ;;
+    --backup-volume=*)
+        VOL="${1#*=}"
+        IFS='/' read -ra VOL_GRP_NAME <<< "$VOL"
+        if [[ ${#VOL_GRP_NAME[@]} -ne 2 ]]; then
+            fatal "Volume name '$VOL' must be in format VOLUME_GROUP/VOLUME_NAME"
+        fi
+        OPT_BACKUP_VOLUMES+=("$VOL")
         shift
         ;;
     -i | --ignore-volume)
