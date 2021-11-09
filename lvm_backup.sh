@@ -527,15 +527,17 @@ volume_cleanup() {
 CL_SNAPSHOT_PATHS=()
 
 cleanup() {
-    local snapshot_path
     log "Cleanup"
     volume_cleanup
-    log "Remove created snapshots"
-    for snapshot_path in "${CL_SNAPSHOT_PATHS[@]}"; do
-        remove_snapshot "$snapshot_path"
-    done
-    CL_SNAPSHOT_PATHS=()
-    log "End backup of LVM volumes"
+    if (( ${#CL_SNAPSHOT_PATHS[@]} )); then
+        local snapshot_path
+        log "Remove created snapshots"
+        for snapshot_path in "${CL_SNAPSHOT_PATHS[@]}"; do
+            remove_snapshot "$snapshot_path"
+        done
+        CL_SNAPSHOT_PATHS=()
+    fi
+    log "Cleanup finished"
 }
 
 cleanup_old_snapshots() {
@@ -674,6 +676,11 @@ backup_snapshot() {
         done
 
         rmdir "$mount_dir"
+
+        kpartx -vd "$volume_path"
+
+        # Remove volume path from the cleanup variable
+        unset 'CL_KPARTX_VOLUME_PATHS[${#CL_KPARTX_VOLUME_PATHS[@]}-1]'
     else
 
         log "No partitions to mount in $volume_path"
@@ -749,6 +756,8 @@ print_help() {
     echo "$0 [options]"
     echo "options:"
     echo "  -l, --list-volumes           Print list of LVM volumes"
+    echo "  -c, --cleanup                Remove old snapshots created by this tool but not deleted due to an error."
+    echo "                               No backup is performed after the cleanup"
     echo "  -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME"
     echo "      --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes"
     echo "  -s, --snapshot-prefix=       Snapshot prefix used for backup snapshots (default: $DEFAULT_LV_SNAPSHOT_PREFIX)"
@@ -777,6 +786,7 @@ for CMD in kpartx rsync; do
 done
 
 OPT_IGNORE_VOLUMES=()
+OPT_CLEANUP=
 OPT_DEST_PATH_PREFIX=
 OPT_KPARTX_RW=
 OPT_DEBUG=
@@ -792,6 +802,10 @@ while [[ "$1" == "-"* ]]; do
         check_root
         list_volumes
         exit 0
+        ;;
+    -c | --cleanup)
+        OPT_CLEANUP=true
+        shift
         ;;
     -i | --ignore-volume)
         VOL="$2"
@@ -876,10 +890,7 @@ if [[ -z "$OPT_LV_SNAPSHOT_PREFIX" ]]; then
     fatal "Snapshot prefix cannot be empty"
 fi
 
-if [[ $EUID -ne 0 ]]; then
-    fatal "You must run this tool as root"
-    # exec sudo -E "$0" "$@"
-fi
+check_root
 
 if [[ -n "$OPT_LOG_FILE" ]]; then
     message "* Log file: $OPT_LOG_FILE"
@@ -887,8 +898,6 @@ if [[ -n "$OPT_LOG_FILE" ]]; then
 else
     trap cleanup EXIT
 fi
-
-log "Start backup of LVM volumes"
 
 if [[ "$OPT_DEBUG" == "true" ]]; then
     set -x
@@ -904,12 +913,16 @@ elif [[ -d "$OPT_DEST_PATH_PREFIX" && "$OPT_DEST_PATH_PREFIX" != */ ]]; then
     OPT_DEST_PATH_PREFIX=$OPT_DEST_PATH_PREFIX/
 fi
 
-message "* Cleanup old snapshots"
-lvm2_for_each_logical_volume cleanup_old_snapshots
+if [[ "$OPT_CLEANUP" = "true" ]]; then
+    message "* Cleanup old snapshots"
+    lvm2_for_each_logical_volume cleanup_old_snapshots
+    exit 0
+fi
 
+log "Start backup of LVM volumes"
 log "Destination path prefix: $OPT_DEST_PATH_PREFIX"
 
 message "* Create and backup snapshots"
 lvm2_for_each_logical_volume create_and_backup_snapshots
 
-message "Backup finished"
+log "End backup of LVM volumes"
