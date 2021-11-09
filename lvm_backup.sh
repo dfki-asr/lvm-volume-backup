@@ -425,9 +425,65 @@ list_volumes() {
     lvm2_for_each_logical_volume print_lvm_volume_info
 }
 
+# Check if volume should be backed up
+# Require defined variables LVM2_VG_NAME, LVM2_LV_NAME, LVM2_LV_ATTR
+# Set variables CREATE_SNAPSHOT, SNAPSHOT_ERROR_REASON
+_volume_check() {
+    local ivol
+    CREATE_SNAPSHOT=true
+    SNAPSHOT_ERROR_REASON=
+
+    for ivol in "${OPT_IGNORE_VOLUMES[@]}"; do
+        if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
+            CREATE_SNAPSHOT=false
+            return 0
+        fi
+    done
+
+    if lvm2_attr_is_cow "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON=snapshots
+    elif lvm2_attr_is_locked "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="locked volumes"
+    elif lvm2_attr_is_pvmove "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="pvmoved volumes"
+    elif lvm2_attr_is_merging_origin "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="an origin that has a merging snapshot"
+    elif lvm2_attr_is_any_cache "$LVM2_LV_ATTR"; then
+        # Actually, this is too strict, because snapshots can be taken from caches
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="cache"
+    elif lvm2_attr_is_thin_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_thin_volume "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="thin pool type volumes"
+    elif lvm2_attr_is_mirror_type_or_pvmove "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="mirror subvolumes or mirrors"
+    elif lvm2_attr_is_raid_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_raid "$LVM2_LV_ATTR"; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="raid subvolumes"
+    fi
+}
+
 print_lvm_volume_info() {
+    local CREATE_SNAPSHOT SNAPSHOT_ERROR_REASON
+    _volume_check
+
     echo "Logical volume: '$LVM2_LV_NAME', volume group: '$LVM2_VG_NAME'"
     lvm2_attr_info "$LVM2_LV_ATTR"
+
+    if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
+        if [[ -n "$SNAPSHOT_ERROR_REASON" ]]; then
+            echo "I will not backup the volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $SNAPSHOT_ERROR_REASON are not supported."
+        else
+            echo "Volume $LVM2_VG_NAME/$LVM2_LV_NAME is ignored"
+        fi
+    else
+        echo "I will backup the volume $LVM2_VG_NAME/$LVM2_LV_NAME"
+    fi
     echo
 }
 
@@ -460,7 +516,9 @@ volume_cleanup() {
         log "Remove kpartx volumes"
         local vol_path
         for vol_path in "${CL_KPARTX_VOLUME_PATHS[@]}"; do
-            kpartx -vd "$vol_path" || true;
+            if [[ -e "$vol_path" ]]; then
+                kpartx -vd "$vol_path" || true;
+            fi
         done
         CL_KPARTX_VOLUME_PATHS=()
     fi
@@ -639,44 +697,15 @@ backup_snapshot() {
 }
 
 create_and_backup_snapshots() {
-    local create_snapshot=true err ivol
+    local CREATE_SNAPSHOT SNAPSHOT_ERROR_REASON
+    _volume_check
 
-    for ivol in "${OPT_IGNORE_VOLUMES[@]}"; do
-        if [[ "$ivol" = "$LVM2_VG_NAME/$LVM2_LV_NAME" ]]; then
-            log "Ignore volume $ivol"
-            return 0
+    if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
+        if [[ -n "$SNAPSHOT_ERROR_REASON" ]]; then
+            message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $SNAPSHOT_ERROR_REASON are not supported."
+        else
+            log "Volume $LVM2_VG_NAME/$LVM2_LV_NAME is ignored"
         fi
-    done
-
-    if lvm2_attr_is_cow "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err=snapshots
-    elif lvm2_attr_is_locked "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="locked volumes"
-    elif lvm2_attr_is_pvmove "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="pvmoved volumes"
-    elif lvm2_attr_is_merging_origin "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="an origin that has a merging snapshot"
-    elif lvm2_attr_is_any_cache "$LVM2_LV_ATTR"; then
-        # Actually, this is too strict, because snapshots can be taken from caches
-        create_snapshot=false
-        err="cache"
-    elif lvm2_attr_is_thin_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_thin_volume "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="thin pool type volumes"
-    elif lvm2_attr_is_mirror_type_or_pvmove "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="mirror subvolumes or mirrors"
-    elif lvm2_attr_is_raid_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_raid "$LVM2_LV_ATTR"; then
-        create_snapshot=false
-        err="raid subvolumes";
-    fi
-
-    if [[ "$create_snapshot" = "false" ]]; then
-        message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $err are not supported."
     else
         message "* Create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME:"
         lvm2_attr_info "$LVM2_LV_ATTR"
@@ -698,8 +727,8 @@ create_and_backup_snapshots() {
         #(set -xe;
         #    lvchange -ay -K "$LVM2_VG_NAME/$lv_snapshot_name";
         #)
-
-        local snapshot_path=$(lvm2_lv_path "$lv_snapshot_name" "$LVM2_VG_NAME")
+        local snapshot_path
+        snapshot_path=$(lvm2_lv_path "$lv_snapshot_name" "$LVM2_VG_NAME")
 
         # Save snapshot path in case of fatal error in cleanup variable
         CL_SNAPSHOT_PATHS+=( "$snapshot_path" )
