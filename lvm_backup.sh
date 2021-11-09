@@ -517,7 +517,6 @@ CL_MOUNT_DIR=
 CL_KPARTX_VOLUME_PATHS=()
 
 volume_cleanup() {
-    log "Volume cleanup"
     if [[ -n "$CL_MOUNT_DIR" ]]; then
         log "Unmounting $CL_MOUNT_DIR"
         umount "$CL_MOUNT_DIR" || true;
@@ -537,11 +536,21 @@ volume_cleanup() {
     fi
 }
 
+CL_LVCREATE_SNAPSHOT_NAME=
+CL_LVCREATE_VG_NAME=
 CL_SNAPSHOT_PATHS=()
 
 cleanup() {
     log "Cleanup"
     volume_cleanup
+    if [[ -n "$CL_LVCREATE_SNAPSHOT_NAME" && -n "$CL_LVCREATE_VG_NAME" ]]; then
+        local snapshot_path
+        snapshot_path=$(lvm2_lv_path "$CL_LVCREATE_SNAPSHOT_NAME" "$CL_LVCREATE_VG_NAME")
+        log "lvcreate was terminated, try to remove the created snapshot"
+        remove_snapshot "$snapshot_path"
+        CL_LVCREATE_SNAPSHOT_NAME=
+        CL_LVCREATE_VG_NAME=
+    fi
     if (( ${#CL_SNAPSHOT_PATHS[@]} )); then
         local snapshot_path
         log "Remove created snapshots"
@@ -731,6 +740,10 @@ create_and_backup_snapshots() {
         lvm2_attr_info "$LVM2_LV_ATTR"
 
         local lv_snapshot_name=${OPT_LV_SNAPSHOT_PREFIX}${LVM2_LV_NAME}
+        # When lvcreate is terminated, we must remove the snapshot 
+        # even if it is not yet registered in the CL_SNAPSHOT_PATHS variable 
+        CL_LVCREATE_SNAPSHOT_NAME=$lv_snapshot_name
+        CL_LVCREATE_VG_NAME=$LVM2_VG_NAME
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
             log "Create snapshot $LVM2_VG_NAME/$lv_snapshot_name"
             (set -xe;
@@ -742,6 +755,8 @@ create_and_backup_snapshots() {
                 lvcreate -l50%FREE -s -n "$lv_snapshot_name" -kn "$LVM2_LV_PATH";
             )
         fi
+        CL_LVCREATE_SNAPSHOT_NAME=
+        CL_LVCREATE_VG_NAME=
 
         #log "Activate snapshot $LVM2_VG_NAME/$lv_snapshot_name"
         #(set -xe;
