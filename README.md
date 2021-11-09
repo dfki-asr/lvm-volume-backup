@@ -13,6 +13,10 @@ Backup LVM volumes
 lvm_backup.sh [options]
 options:
   -l, --list-volumes           Print list of LVM volumes
+  -c, --cleanup                Remove old snapshots created by this tool but not deleted due to an error.
+                               No backup is performed after the cleanup
+  -b, --backup-volume=         Backup volume specified in format VOLUME_GROUP/VOLUME_NAME.
+                               If no backup volumes are specified, all found volumes will be backed up
   -i, --ignore-volume=         Ignore volume specified in format VOLUME_GROUP/VOLUME_NAME
       --ignore-mount-error     Ignore errors when mounting volumes and continue with other volumes
   -s, --snapshot-prefix=       Snapshot prefix used for backup snapshots (default: bak_snap_)
