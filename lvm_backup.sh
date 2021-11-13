@@ -429,8 +429,14 @@ list_volumes() {
 # Require defined variables LVM2_VG_NAME, LVM2_LV_NAME, LVM2_LV_ATTR
 # Set variables CREATE_SNAPSHOT, SNAPSHOT_ERROR_REASON
 _volume_check() {
-    local ivol
+    local ivol err
     SNAPSHOT_ERROR_REASON=
+
+    if [[ "$LVM2_LV_NAME" == "$OPT_LV_SNAPSHOT_PREFIX"* ]]; then
+        CREATE_SNAPSHOT=false
+        SNAPSHOT_ERROR_REASON="Snapshots of backup snapshots are not supported, use --cleanup option"
+        return 0
+    fi
 
     if (( ${#OPT_BACKUP_VOLUMES[@]} )); then
         CREATE_SNAPSHOT=false
@@ -455,30 +461,31 @@ _volume_check() {
 
     if lvm2_attr_is_cow "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON=snapshots
+        err=snapshots
     elif lvm2_attr_is_locked "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="locked volumes"
+        err="locked volumes"
     elif lvm2_attr_is_pvmove "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="pvmoved volumes"
+        err="pvmoved volumes"
     elif lvm2_attr_is_merging_origin "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="an origin that has a merging snapshot"
+        err="an origin that has a merging snapshot"
     elif lvm2_attr_is_any_cache "$LVM2_LV_ATTR"; then
         # Actually, this is too strict, because snapshots can be taken from caches
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="cache"
+        err="cache"
     elif lvm2_attr_is_thin_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_thin_volume "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="thin pool type volumes"
+        err="thin pool type volumes"
     elif lvm2_attr_is_mirror_type_or_pvmove "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="mirror subvolumes or mirrors"
+        err="mirror subvolumes or mirrors"
     elif lvm2_attr_is_raid_type "$LVM2_LV_ATTR" && ! lvm2_attr_is_raid "$LVM2_LV_ATTR"; then
         CREATE_SNAPSHOT=false
-        SNAPSHOT_ERROR_REASON="raid subvolumes"
+        err="raid subvolumes"
     fi
+    SNAPSHOT_ERROR_REASON="Snapshots of $err are not supported"
 }
 
 print_lvm_volume_info() {
@@ -490,7 +497,7 @@ print_lvm_volume_info() {
 
     if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
         if [[ -n "$SNAPSHOT_ERROR_REASON" ]]; then
-            echo "I will not backup the volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $SNAPSHOT_ERROR_REASON are not supported."
+            echo "I will not backup the volume $LVM2_VG_NAME/$LVM2_LV_NAME: $SNAPSHOT_ERROR_REASON."
         else
             echo "Volume $LVM2_VG_NAME/$LVM2_LV_NAME is ignored"
         fi
@@ -588,9 +595,9 @@ mount_and_backup() {
         message "* Contents of the volume $vol_path:"
         ls -lA "$mount_dir"
 
-        if [[ "$OPT_RSYNC_MODE" = "true" ]]; then
+        if [[ "$OPT_SYNC_MODE" = "true" ]]; then
             # Rsync mode, dest_path is a directory
-            local src_dir dest_dir
+            local src_dir dest_dir sync_cmd shell_val
 
             if [[ "$mount_dir" = */ ]]; then
                 src_dir=$mount_dir
@@ -603,10 +610,17 @@ mount_and_backup() {
                 dest_dir=${dest_path}/
             fi
 
+            printf -v shell_val "%q" "$src_dir"
+            sync_cmd=${OPT_SYNC_CMD//"{src}"/"${shell_val}"}
+            printf -v shell_val "%q" "$dest_dir"
+            sync_cmd=${sync_cmd//"{dest}"/"${shell_val}"}
+
             mkdir -p "$dest_dir";
-            log "Backup with rsync from $src_dir to $dest_dir"
-            (set -xe;
-                rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+            log "Backup from $src_dir to $dest_dir"
+            (set -e;
+                eval "set -x; ${sync_cmd}";)
+            #(set -xe;
+            #    rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
         else
             local tar_file
             # Tar mode, dest_path is a tar file
@@ -731,7 +745,7 @@ create_and_backup_snapshots() {
 
     if [[ "$CREATE_SNAPSHOT" = "false" ]]; then
         if [[ -n "$SNAPSHOT_ERROR_REASON" ]]; then
-            message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: Snapshots of $SNAPSHOT_ERROR_REASON are not supported."
+            message "* Can't create snapshot from volume $LVM2_VG_NAME/$LVM2_LV_NAME: $SNAPSHOT_ERROR_REASON."
         else
             log "Volume $LVM2_VG_NAME/$LVM2_LV_NAME is ignored"
         fi
@@ -778,6 +792,8 @@ create_and_backup_snapshots() {
     echo;
 }
 
+DEFAULT_SYNC_CMD="rsync -av --delete --exclude=\"lost+found\" {src} {dest}"
+
 print_help() {
     echo "Backup LVM volumes"
     echo
@@ -795,6 +811,9 @@ print_help() {
     echo "      --overwrite              Overwrite backup files"
     echo "  -p, --dest-prefix=           Destination path prefix (add / at the end for directory)"
     echo "      --rsync                  Use rsync instead of tar"
+    echo "                               (is equivalent to --sync-cmd='$DEFAULT_SYNC_CMD')"
+    echo "      --sync-cmd=              Use custom synchronization command and arguments instead of rsync,"
+    echo "                               {src} is replaced by the source directory and {dest} by the destination directory"
     echo "  -d, --debug                  Enable debug mode"
     echo "      --log-file=              Log all output and errors to the specified log file"
     echo "      --                       End of options"
@@ -824,8 +843,9 @@ OPT_DEBUG=
 OPT_LOG_FILE=
 OPT_OVERWRITE=
 OPT_IGNORE_MOUNT_ERROR=
-OPT_RSYNC_MODE=
+OPT_SYNC_MODE=
 OPT_COMPR_EXT=bz2
+OPT_SYNC_CMD=${DEFAULT_SYNC_CMD}
 
 while [[ "$1" == "-"* ]]; do
     case "$1" in
@@ -903,7 +923,18 @@ while [[ "$1" == "-"* ]]; do
         shift
         ;;
     --rsync)
-        OPT_RSYNC_MODE=true
+        OPT_SYNC_MODE=true
+        OPT_SYNC_CMD=${DEFAULT_SYNC_CMD}
+        shift
+        ;;
+    --sync-cmd)
+        OPT_SYNC_CMD="$2"
+        OPT_SYNC_MODE=true
+        shift 2
+        ;;
+    --sync-cmd=*)
+        OPT_SYNC_CMD="${1#*=}"
+        OPT_SYNC_MODE=true
         shift
         ;;
     -d|--debug)
@@ -966,6 +997,10 @@ if [[ "$OPT_CLEANUP" = "true" ]]; then
     message "* Cleanup old snapshots"
     lvm2_for_each_logical_volume cleanup_old_snapshots
     exit 0
+fi
+
+if [[ "$OPT_SYNC_MODE" = "true" ]]; then
+    message "* Synchronization command: ${OPT_SYNC_CMD}"
 fi
 
 log "Start backup of LVM volumes"
