@@ -569,12 +569,37 @@ cleanup() {
     log "Cleanup finished"
 }
 
-cleanup_old_snapshots() {
-    # Cleanup of old snapshots
+cleanup_remnant_snapshots() {
+    # Cleanup of remnant snapshots
     if lvm2_attr_is_cow "$LVM2_LV_ATTR" || [[ -n "$LVM2_ORIGIN" ]]; then
         message "* Check snapshot $LVM2_LV_NAME / $LVM2_VG_NAME"
         if [[ "$LVM2_LV_NAME" == "$OPT_LV_SNAPSHOT_PREFIX"* ]]; then
-            log "Remove old snapshot $LVM2_LV_PATH"
+            message "* Snapshot $LVM2_LV_NAME / $LVM2_VG_NAME was identified as a remnant"
+            # Try to umount if possible
+            if ! command -v findmnt >/dev/null 2>&1; then
+                message "! findmnt command is missing, cannot test for mounted directories !"
+            else
+                local mounted_path findmnt_output
+                if findmnt_output=$(findmnt -l -n -o TARGET -S "$LVM2_LV_PATH"); then
+                    while IFS= read -r mounted_path; do
+                        if [[ "$mounted_path" == /tmp/volume-backup.* ]]; then
+                            message "* Found mounted temporary directory $mounted_path"
+                            if umount "$mounted_path"; then
+                                message "* Unmounted temporary directory $mounted_path"
+                                if rmdir "$mounted_path"; then
+                                    message "* Deleted temporary directory $mounted_path"
+                                else
+                                    message "* Could not delete temporary directory $mounted_path"
+                                fi
+                            else
+                                error "* Could not unmount directory $mounted_path"
+                            fi
+                        fi
+                    done <<<"$findmnt_output"
+                fi
+            fi
+
+            log "Remove remnant snapshot $LVM2_LV_PATH"
             (set -xe;
                 if ! lvremove -y "$LVM2_LV_PATH"; then
                     # Try to remove kpartx mapping
@@ -754,8 +779,8 @@ create_and_backup_snapshots() {
         lvm2_attr_info "$LVM2_LV_ATTR"
 
         local lv_snapshot_name=${OPT_LV_SNAPSHOT_PREFIX}${LVM2_LV_NAME}
-        # When lvcreate is terminated, we must remove the snapshot 
-        # even if it is not yet registered in the CL_SNAPSHOT_PATHS variable 
+        # When lvcreate is terminated, we must remove the snapshot
+        # even if it is not yet registered in the CL_SNAPSHOT_PATHS variable
         CL_LVCREATE_SNAPSHOT_NAME=$lv_snapshot_name
         CL_LVCREATE_VG_NAME=$LVM2_VG_NAME
         if lvm2_attr_is_thin_type "$LVM2_LV_ATTR"; then
@@ -800,7 +825,7 @@ print_help() {
     echo "$0 [options]"
     echo "options:"
     echo "  -l, --list-volumes           Print list of LVM volumes"
-    echo "  -c, --cleanup                Remove old snapshots created by this tool but not deleted due to an error."
+    echo "  -c, --cleanup                Remove remnant snapshots created by this tool but not deleted due to an error."
     echo "                               No backup is performed after the cleanup"
     echo "  -b, --backup-volume=         Backup volume specified in format VOLUME_GROUP/VOLUME_NAME."
     echo "                               If no backup volumes are specified, all found volumes will be backed up"
@@ -994,8 +1019,8 @@ elif [[ -d "$OPT_DEST_PATH_PREFIX" && "$OPT_DEST_PATH_PREFIX" != */ ]]; then
 fi
 
 if [[ "$OPT_CLEANUP" = "true" ]]; then
-    message "* Cleanup old snapshots"
-    lvm2_for_each_logical_volume cleanup_old_snapshots
+    message "* Cleanup remnant snapshots"
+    lvm2_for_each_logical_volume cleanup_remnant_snapshots
     exit 0
 fi
 
