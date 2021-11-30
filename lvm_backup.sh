@@ -41,6 +41,35 @@ dbg() {
     echo >&2 "Debug: $*"
 }
 
+case "$(uname)" in
+    MINGW*)
+        _ps() {
+            ps -a | awk 'NR>1 { print $1, $2; }'
+        }
+        ;;
+    *)
+        _ps() {
+            ps -o pid,ppid -ax
+        }
+        ;;
+esac
+
+_get_children_pids() {
+    local pid=$1
+    local all_pids=$2
+    local children
+    for child in $(awk "{ if ( \$2 == $pid ) { print \$1 } }" <<<"$all_pids"); do
+        children="$(_get_children_pids "$child" "$all_pids") $child $children"
+    done
+    echo "$children"
+}
+
+get_children_pids() {
+    local pid=$1 all_pids
+    all_pids=$(_ps)
+    _get_children_pids "$pid" "$all_pids"
+}
+
 enable_file_logging() {
     if [[ -z "$OPT_LOG_FILE" ]]; then
         fatal "The OPT_LOG_FILE variable must not be empty."
@@ -66,13 +95,14 @@ enable_file_logging() {
         err_command="${2}"
         err_code="${3:-0}"
 
-        ## Workaround for read EOF combo tripping traps
         if ! ((err_code)); then
             return "${err_code}"
         fi
 
+        ## https://unix.stackexchange.com/questions/39623/trap-err-and-echoing-the-error-line
+        ## Workaround for read EOF combo tripping traps
         errmsg=$(awk 'NR>L-4 && NR<L+4 { printf "%-5d%3s%s\n",NR,(NR==L?">>>":""),$0 }' L="$err_lineno" "$0")
-        log "Error occurred in '$err_command' command
+        log "Error $err_code occurred in '$err_command' command
 $errmsg"
         if ((BASH_SUBSHELL != 0)); then
             # Exit from subshell
@@ -94,7 +124,7 @@ $errmsg"
 
         if ((err_code)); then
             errmsg=$(awk 'NR>L-4 && NR<L+4 { printf "%-5d%3s%s\n",NR,(NR==L?">>>":""),$0 }' L="$err_lineno" "$0")
-            log "Error occurred in '$err_command' command (function $err_funcname, line $err_lineno)
+            log "Error $err_code occurred in '$err_command' command (function $err_funcname, line $err_lineno)
 $errmsg"
         fi
 
@@ -106,7 +136,7 @@ $errmsg"
         exec 2<&-
     }
 
-    trap 'on_exit "${LINENO}" "${FUNCNAME}" "${BASH_COMMAND}" "${?}"' EXIT
+    trap 'on_exit "${LINENO}" "${FUNCNAME}" "${BASH_COMMAND}" "${?}"' EXIT INT TERM
 }
 ### END LOGGING
 
@@ -547,8 +577,47 @@ CL_LVCREATE_SNAPSHOT_NAME=
 CL_LVCREATE_VG_NAME=
 CL_SNAPSHOT_PATHS=()
 
+kill-children() {
+    local children_pids pid
+    children_pids=$(get_children_pids "$$")
+    for pid in $children_pids; do
+        kill "$pid" 2>/dev/null || true;
+    done
+}
+
+CL_BACKUP_PID=
+
 cleanup() {
     log "Cleanup"
+    if command -v pstree >/dev/null 2>&1; then
+        pstree -plans "$$";
+    fi
+    if [[ -n "$CL_BACKUP_PID" ]]; then
+        local children_pids pid
+        children_pids=$(get_children_pids "$CL_BACKUP_PID")
+        log "My PID $$"
+        log "Backup process PID $CL_BACKUP_PID"
+        log "Kill children [ $children_pids ]"
+
+        # Send TERM signal to all children
+        for pid in $children_pids $CL_BACKUP_PID; do
+            kill -INT -- "$pid" 2>/dev/null || true;
+            sleep 0.5;
+            kill -TERM -- "$pid" 2>/dev/null || true;
+        done
+
+        # Wait for all children
+        for pid in $children_pids $CL_BACKUP_PID; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log "Wait for process $pid"
+                ps -up "$pid" || true;
+                while kill -0 "$pid" 2>/dev/null; do
+                    sleep 0.5
+                done
+            fi
+        done
+    fi
+
     volume_cleanup
     if [[ -n "$CL_LVCREATE_SNAPSHOT_NAME" && -n "$CL_LVCREATE_VG_NAME" ]]; then
         local snapshot_path
@@ -567,6 +636,10 @@ cleanup() {
         CL_SNAPSHOT_PATHS=()
     fi
     log "Cleanup finished"
+
+    #if command -v pstree >/dev/null 2>&1; then
+    #    pstree -plans
+    #fi
 }
 
 cleanup_remnant_snapshots() {
@@ -612,7 +685,7 @@ cleanup_remnant_snapshots() {
 }
 
 mount_and_backup() {
-    local vol_path=$1 mount_dir=$2 dest_path=$3
+    local vol_path=$1 mount_dir=$2 dest_path=$3 exit_code
 
     if mount -o ro -t auto "$vol_path" "$mount_dir"; then
         CL_MOUNT_DIR=$mount_dir
@@ -643,9 +716,17 @@ mount_and_backup() {
             mkdir -p "$dest_dir";
             log "Backup from $src_dir to $dest_dir"
             (set -e;
-                eval "set -x; ${sync_cmd}";)
-            #(set -xe;
-            #    rsync -av --delete --exclude="lost+found" "$src_dir" "$dest_dir";)
+                eval "set -x; ${sync_cmd}";
+            ) &
+            CL_BACKUP_PID=$!
+            set +e
+            wait "$CL_BACKUP_PID"
+            exit_code=$?
+            set -e
+            CL_BACKUP_PID=
+            if (( exit_code != 0 )); then
+                exit $exit_code
+            fi
         else
             local tar_file
             # Tar mode, dest_path is a tar file
@@ -665,6 +746,15 @@ mount_and_backup() {
             (set -xe;
                 tar --exclude "./lost+found" -C "$mount_dir" -cvf "$tar_file" .;
             )
+            CL_BACKUP_PID=$!
+            set +e
+            wait "$CL_BACKUP_PID"
+            exit_code=$?
+            set -e
+            CL_BACKUP_PID=
+            if (( exit_code != 0 )); then
+                exit $exit_code
+            fi
         fi
 
         umount "$mount_dir"
@@ -707,8 +797,6 @@ backup_snapshot() {
         kpartx_parts+=("$kpartx_part")
     fi
 
-    #kpartx_parts=()
-    #while IFS='' read -r line; do kpartx_parts+=("$line"); done <<<"$kpartx_out"
     if [[ "${#kpartx_parts[@]}" -ne 0 ]]; then
         if [[ "$OPT_KPARTX_RW" = "true" ]]; then
             kpartx -av "$volume_path"
@@ -730,7 +818,6 @@ backup_snapshot() {
             #    fsck "$part_dev"
             #fi
 
-            # dest_path=${OPT_DEST_PATH_PREFIX}${vg_name}-${orig_lv_name}-${part_name}
             dest_path=${OPT_DEST_PATH_PREFIX}${vg_name}-${orig_lv_name}-${counter}
 
             mount_and_backup "$part_dev" "$mount_dir" "$dest_path"
@@ -746,12 +833,6 @@ backup_snapshot() {
 
         log "No partitions to mount in $volume_path"
         log "Trying to mount a full volume as disk"
-
-        #kpartx -l "$volume_path"; #DBG
-        #ls -lah "$volume_path"; #DBG
-        #export volume_path mount_dir
-        #message "Interactive"
-        #bash -i
 
         local mount_dir dest_path
         mount_dir=$(mktemp -d /tmp/volume-backup.XXXXXXXXXX) || fatal "Could not create mount directory"
@@ -1001,7 +1082,7 @@ if [[ -n "$OPT_LOG_FILE" ]]; then
     message "* Log file: $OPT_LOG_FILE"
     enable_file_logging
 else
-    trap cleanup EXIT
+    trap cleanup EXIT INT TERM
 fi
 
 if [[ "$OPT_DEBUG" == "true" ]]; then
