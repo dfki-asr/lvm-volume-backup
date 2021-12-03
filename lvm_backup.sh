@@ -43,13 +43,17 @@ dbg() {
 
 case "$(uname)" in
     MINGW*)
-        _ps() {
-            ps -a | awk 'NR>1 { print $1, $2; }'
+        get_children_pids() {
+            local pid=$1 all_pids
+            all_pids=$(ps -a | awk 'NR>1 { print $1, $2; }')
+            _get_children_pids "$pid" "$all_pids"
         }
         ;;
     *)
-        _ps() {
-            ps -o pid,ppid -ax
+        get_children_pids() {
+            local pid=$1 all_pids
+            all_pids=$(ps -o pid,ppid -ax)
+            _get_children_pids "$pid" "$all_pids"
         }
         ;;
 esac
@@ -58,25 +62,42 @@ _get_children_pids() {
     local pid=$1
     local all_pids=$2
     local children
-    for child in $(awk "{ if ( \$2 == $pid ) { print \$1 } }" <<<"$all_pids"); do
-        children="$(_get_children_pids "$child" "$all_pids") $child $children"
+    local child_pids
+    child_pids=$(awk "{ if ( \$2 == $pid ) { print \$1 } }" <<<"$all_pids")
+    for child_pid in $child_pids; do
+        children="$(_get_children_pids "$child_pid" "$all_pids") $child_pid $children"
     done
     echo "$children"
 }
 
-get_children_pids() {
-    local pid=$1 all_pids
-    all_pids=$(_ps)
-    _get_children_pids "$pid" "$all_pids"
+
+kill_children() {
+    local children_pids pid
+    children_pids=$(get_children_pids "$$")
+    for pid in $children_pids; do
+        kill "$pid" 2>/dev/null || true;
+    done
+    if [[ "$1" = "--wait" ]]; then
+        for pid in $children_pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                while kill -0 "$pid" 2>/dev/null; do
+                    sleep 0.5
+                done
+            fi
+        done
+    fi
 }
 
+# https://stackoverflow.com/questions/3173131/redirect-copy-of-stdout-to-log-file-from-within-bash-script-itself/11886837#11886837
+# https://www.natewoodward.org/blog/2019/11/25/process-substitution-and-race-conditions
 enable_file_logging() {
     if [[ -z "$OPT_LOG_FILE" ]]; then
         fatal "The OPT_LOG_FILE variable must not be empty."
     fi
 
-    exec > >(tee -ia "$OPT_LOG_FILE")
-    exec 2> >(tee -ia "$OPT_LOG_FILE" >&2)
+    exec &> >(tee -ia "$OPT_LOG_FILE";)
+    #exec > >(tee -ia "$OPT_LOG_FILE")
+    #exec 2> >(tee -ia "$OPT_LOG_FILE" >&2)
 
     ## Close STDOUT file descriptor
     #exec 1<&-
@@ -134,6 +155,9 @@ $errmsg"
         exec 1<&-
         # Close STDERR FD
         exec 2<&-
+
+        # Stop all child processes (e.g. tea logging processes) if they are still running.
+        kill_children --wait >>"$OPT_LOG_FILE" 2>&1 || true;
     }
 
     trap 'on_exit "${LINENO}" "${FUNCNAME}" "${BASH_COMMAND}" "${?}"' EXIT INT TERM
@@ -577,19 +601,12 @@ CL_LVCREATE_SNAPSHOT_NAME=
 CL_LVCREATE_VG_NAME=
 CL_SNAPSHOT_PATHS=()
 
-kill-children() {
-    local children_pids pid
-    children_pids=$(get_children_pids "$$")
-    for pid in $children_pids; do
-        kill "$pid" 2>/dev/null || true;
-    done
-}
-
 CL_BACKUP_PID=
 
 cleanup() {
     log "Cleanup"
     if command -v pstree >/dev/null 2>&1; then
+        echo "My PID $$";
         pstree -plans "$$";
     fi
     if [[ -n "$CL_BACKUP_PID" ]]; then
@@ -636,10 +653,6 @@ cleanup() {
         CL_SNAPSHOT_PATHS=()
     fi
     log "Cleanup finished"
-
-    #if command -v pstree >/dev/null 2>&1; then
-    #    pstree -plans
-    #fi
 }
 
 cleanup_remnant_snapshots() {
