@@ -758,7 +758,7 @@ mount_and_backup() {
 
             (set -xe;
                 tar --exclude "./lost+found" -C "$mount_dir" -cvf "$tar_file" .;
-            )
+            ) &
             CL_BACKUP_PID=$!
             set +e
             wait "$CL_BACKUP_PID"
